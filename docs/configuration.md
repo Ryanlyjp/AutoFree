@@ -1,0 +1,211 @@
+# 配置说明
+
+AutoFree 把配置分成两层：
+
+| 文件 | 谁改 | 重启? |
+|---|---|---|
+| `data/.env` | 部署者 | 是。改完重启 `autofree api`. |
+| `data/settings.json` | Web UI（或 PATCH API） | **否**，下一次任务读到新值即生效 |
+
+`.env` 只放真正不能放 JSON 的东西（API Key 之类）。其余 (proxy / 邮箱后端 / CPA) 全部 `settings.json`。
+
+---
+
+## .env 字段
+
+```dotenv
+# 必填 — Web Bearer 鉴权用
+AUTOFREE_API_KEY=随机串
+
+# 可选 — 首次启动时这些会被复制成 settings.json 的初始值。
+# settings.json 创建后 .env 这些值就不再生效（settings.json 优先）。
+HTTP_PROXY=
+MAIL_PROVIDER=tempmail
+TEMPMAIL_BASE_URL=
+TEMPMAIL_API_KEY=
+TEMPMAIL_DOMAIN=
+CLOUDMAIL_BASE_URL=
+CLOUDMAIL_PASSWORD=
+CLOUDMAIL_DOMAIN=
+MAILLAB_API_URL=
+MAILLAB_USERNAME=
+MAILLAB_PASSWORD=
+MAILLAB_DOMAIN=
+CPA_BASE_URL=
+CPA_KEY=
+
+# 高级 — 一般不改
+EMAIL_POLL_INTERVAL=3                 # OTP 轮询周期 (秒)
+EMAIL_POLL_TIMEOUT=120                # OTP 单封等待上限 (秒)
+AP_PROPAGATION_DELAY=5                # auto_provision 开启后的等待 (秒,留时间让 OpenAI 后端同步)
+```
+
+---
+
+## settings.json 结构
+
+```json
+{
+  "proxy": "http://127.0.0.1:7890",
+  "mail": {
+    "provider": "tempmail",
+    "tempmail": {
+      "base_url": "http://tempmail.local",
+      "api_key": "...",
+      "domain": "@mail.example.com"
+    },
+    "cf_temp_email": {
+      "base_url": "https://worker.example.com/api",
+      "password": "...",
+      "domain": "@example.com"
+    },
+    "maillab": {
+      "api_url": "https://maillab.example.com/api",
+      "username": "admin@example.com",
+      "password": "...",
+      "domain": "@example.com"
+    }
+  },
+  "cpa": {
+    "base_url": "http://127.0.0.1:8317",
+    "key": "..."
+  }
+}
+```
+
+直接编辑这个文件也行，但 **改完 web 也要刷新页面** 才能看到（前端有缓存）。改运行中的任务无效 — 任务读的是启动那一刻的 settings 快照。
+
+---
+
+## 在网页改
+
+| 区域 | 字段 | probe |
+|---|---|---|
+| 代理 | `proxy` | — |
+| 邮箱后端 | provider 切换 + 各自 base_url / 密码 / 域名 | **测试连通** 调 `MailProvider.login()` |
+| CLIProxyAPI | `base_url` + `key` | **probe** 调 `GET /v0/management/auth-files` 看通不通 |
+| 母号 session_token | `session_token` (+ 可选 `account_id` / `email`) | **导入并验证** 自动调 `/api/auth/session` |
+| 母号 account_id | 单独覆盖 (适合 session_token 已导入但 workspace 拿错的情况) | — |
+| 母号 probe | — | **probe identity + members** 调 `/identity` + `/users` |
+
+> 表单提交后,响应里会把 password / api_key / cpa.key 这些字段返回为 `<set:N>` (N = 长度)，**不要把这个伪字符串再次提交**，前端代码会自动剥掉，但如果你直接调 PATCH API，记得别带它。
+
+---
+
+## 三个邮箱后端的差别
+
+| 项 | tempmail | cf_temp_email | maillab |
+|---|---|---|---|
+| 部署难度 | 中（要 Postgres + Postfix） | 低（Cloudflare Workers） | 中（要 D1 + 自部署） |
+| 鉴权 | Bearer token | `x-admin-auth` header | `Authorization: <jwt>` (无 Bearer 前缀) |
+| 创建邮箱接口 | `POST /api/mailboxes` | `POST /admin/new_address` | `POST /account/add` |
+| OTP 提取 | **服务端** `/otp/latest` 内置正则 | 客户端正则 | 客户端正则 |
+| 自动建箱 (catch-all) | ✅ | ❌ | ❌ |
+| 多域名池 | ✅ | ✅ | ✅ |
+
+**推荐 CTF 用 tempmail** — `/otp/latest` 服务端正则比客户端的更鲁棒，能省一次邮件解析的来回。
+
+---
+
+## 母号导入
+
+session_token 是关键凭据，三种来源：
+
+### A. 浏览器手抄（最快）
+
+1. 母号已登录的浏览器 → DevTools (F12) → Application → Storage → Cookies → `https://chatgpt.com`
+2. 找到 `__Secure-next-auth.session-token`
+3. 直接复制 value 列。**注意**：cookie 太长会被自动拆成 `__Secure-next-auth.session-token.0` 和 `.1`，按 `.0`+`.1` 顺序拼起来。
+
+```
+[  浏览器 cookie 表  ]
+    name                                    value
+    __Secure-next-auth.session-token.0      eyJhbGciOi...AAA
+    __Secure-next-auth.session-token.1      BBB...zzzZZZ
+
+session_token = "eyJhbGciOi...AAABBB...zzzZZZ"   # 顺序拼接
+```
+
+把它粘贴到 Setup 页的 **session_token** 文本框里。AutoFree 内部会判断长度 > 3800 自动拆 `.0/.1` 发回去。
+
+### B. CLI
+
+```bash
+uv run autofree import-token
+# session_token (从浏览器 cookie 复制): <粘贴>
+```
+
+stdin 模式不显示输入。
+
+### C. Playwright 邮箱密码登录（实验）
+
+只在你有母号密码并且能解决 Cloudflare 时用：
+
+```python
+from autofree.flow import master_playwright_login
+master_playwright_login(
+    email="master@example.com",
+    password="...",
+    proxy="http://127.0.0.1:7890",
+    headless=False,    # 第一次让浏览器开着,你能看进度
+)
+```
+
+不推荐：Cloudflare 5s 挑战 + 邮件 OTP 几乎一定要人盯着，CTF 时间紧不如直接抄 cookie。
+
+---
+
+## 输出目录
+
+```
+data/
+├── .env                            部署时人工写
+├── settings.json                   web 改 / PATCH /api/settings 改
+├── settings.json.bak               settings.json 解析失败时自动备份
+├── admin_state.json                母号信息 (mode 0600)
+├── auths/
+│   └── <email>.json                每个 free 号一份 (mode 0600)
+├── runs/
+│   └── <run_id>.json               每个任务一份,含完整 logs / cohort
+└── logs/                           预留,目前没用
+```
+
+如果想转移配置到另一台机器：拷贝整个 `data/` 即可（除了 `.env` 和 `admin_state.json` 因为含密）。
+
+---
+
+## 高级
+
+### 跨 host 部署
+
+`autofree api --host 0.0.0.0 --port 8788` 后用 nginx 反代:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8788;
+    proxy_set_header Host $host;
+    proxy_http_version 1.1;
+}
+```
+
+记得 nginx 不要加默认 timeout,任务可能跑很久。
+
+### 多实例隔离
+
+把环境变量改一下让 `data/` 路径分开:
+
+```bash
+# 实例 A
+PYTHONPATH=src python3 -m autofree api &
+# 实例 B
+cd /path/to/another/AutoFree
+PYTHONPATH=src python3 -m autofree api --port 8789 &
+```
+
+或者 docker-compose 跑两个 stack（自己加 Dockerfile;项目自带的占位）.
+
+### 并发 (实验)
+
+当前 runner.py 是 **完全串行**。如果想并发跑多个浏览器，在不同 `data/` 目录起多个 autofree 实例，每个用不同的母号 + 不同的代理出口 IP，效果≈手动多开。
+
+不要在同一个母号 + 同一个 IP 上并发 — Cloudflare 会拉黑 5 分钟。
