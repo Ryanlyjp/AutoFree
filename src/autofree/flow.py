@@ -1109,6 +1109,13 @@ class Flow:
         if code:
             return False, code
 
+        # CRITICAL: the Codex consent page renders a workspace radio list and
+        # **defaults to the Team workspace** (first option). If we just click
+        # "Continue" without selecting Personal first, OAuth completes with a
+        # team-plan token, not the free-plan one we want.
+        # Click the Personal radio BEFORE clicking Continue.
+        self._click_personal_workspace_radio()
+
         selectors = [
             "button[data-dd-action-name='Continue']",
             "button:has-text('Continue')",
@@ -1151,6 +1158,64 @@ class Flow:
                         return True, code
         return False, None
 
+    def _click_personal_workspace_radio(self) -> bool:
+        """On the Codex consent page, click the 'Personal account' radio so
+        the form's selected workspace is the personal one (instead of the
+        Team default).
+
+        Looks for English / Chinese label variants. Returns True if a radio
+        was clicked. Failure is non-fatal — the API workspace/select path
+        runs separately.
+        """
+        # Variants in priority order. Stop at the first that exists+visible.
+        # Pure-text matches: "Personal account" English, "个人账户/个人空间" CJK.
+        # Fallback: pick the LAST radio in the workspace list (Team is first).
+        candidates: list[tuple[str, str]] = [
+            ("text=/^Personal account$/i", "exact 'Personal account'"),
+            ("text=/^Personal Account$/", "exact 'Personal Account'"),
+            ("text=/Personal account/i", "contains 'Personal account'"),
+            ("[role='radio']:has-text('Personal')", "[role=radio] :has-text Personal"),
+            ("label:has-text('Personal account')", "label :has-text 'Personal account'"),
+            ("text=/个人(?:账户|账号|空间)/", "中文 个人账户/账号/空间"),
+            ("[role='radio']:has-text('个人')", "[role=radio] :has-text 个人"),
+        ]
+        for selector, desc in candidates:
+            try:
+                loc = self.page.locator(selector).first
+                if loc.count() < 1:
+                    continue
+                if not loc.is_visible(timeout=500):
+                    continue
+                loc.click(timeout=3000)
+                self.p(f"[OAuth][consent] ✓ 已点选 Personal radio (selector: {desc})")
+                try:
+                    self.page.wait_for_timeout(600)
+                except Exception:
+                    time.sleep(0.6)
+                return True
+            except Exception as exc:
+                self.p(f"[OAuth][consent]   尝试 {desc} 失败: {exc}", "debug")
+                continue
+
+        # Last-resort fallback: pick the last radio in the page. Codex consent
+        # lists Team first, Personal second.
+        try:
+            radios = self.page.locator("[role='radio']")
+            n = radios.count()
+            if n >= 2:
+                radios.nth(n - 1).click(timeout=3000)
+                self.p(f"[OAuth][consent] ✓ 已点选最后一个 [role=radio] (共 {n} 个,fallback 选最后)")
+                try:
+                    self.page.wait_for_timeout(600)
+                except Exception:
+                    time.sleep(0.6)
+                return True
+        except Exception:
+            pass
+
+        self.p("[OAuth][consent] ⚠ 未找到 Personal account radio,继续点 Continue (可能拿到 team token)", "warning")
+        return False
+
     def _resolve_code_from_consent(self, consent_url: str, referer: str | None) -> str | None:
         candidates: list[str] = []
         seen = set()
@@ -1176,22 +1241,29 @@ class Flow:
             if code:
                 return code
 
+            current = self._abs_auth_url(getattr(self.page, "url", "")) or candidate
+
+            # Step A — try the **API** workspace/select path FIRST. This sends
+            # `{"workspace_id": <personal>}` directly, bypassing the consent
+            # UI entirely. When it works, returns a usable code.
+            try:
+                code = self._select_personal_workspace(current)
+                if code:
+                    self.p("[OAuth][consent] ✓ 通过 API workspace/select 拿到 code")
+                    return code
+            except FlowError as exc:
+                self.p(f"[OAuth][consent] API workspace/select 失败: {exc}", "warning")
+
+            # Step B — UI fallback. Click 'Personal account' radio + Continue.
             clicked, code = self._auto_click_consent(candidate, referer=referer)
             if code:
+                self.p("[OAuth][consent] ✓ 通过 UI click 拿到 code")
                 return code
 
             current = self._abs_auth_url(getattr(self.page, "url", "")) or candidate
             code = self._follow_browser_continue(referer=current, max_age=20.0)
             if code:
                 return code
-
-            # Personal-only workspace selection (the "key step" in the brief).
-            try:
-                code = self._select_personal_workspace(current)
-                if code:
-                    return code
-            except FlowError as exc:
-                self.p(f"[OAuth] {exc}")
 
             if clicked:
                 current = self._abs_auth_url(getattr(self.page, "url", "")) or current

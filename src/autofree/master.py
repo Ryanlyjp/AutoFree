@@ -312,102 +312,141 @@ class MasterClient:
 
     # ---- members ----
 
-    # chatgpt admin /users supports limit/after pagination. Default page can be
-    # small (e.g. 20), so without paging a large team only sees the first page.
+    # chatgpt admin /users uses offset/limit pagination (verified via kick.har:
+    # GET /backend-api/accounts/{id}/users?offset=0&limit=25&query=).
+    # Default UI limit is 25; we use 100 to need fewer round-trips.
     _MEMBER_PAGE_SIZE = 100
 
-    def list_members(self) -> list[dict[str, Any]]:
-        """List all members of the master workspace.
+    def _normalize_member_row(self, row: dict) -> dict[str, Any] | None:
+        """Map an API row to {user_id, email, name, role, status, raw}.
+        Returns None if user_id is missing (skip)."""
+        if not isinstance(row, dict):
+            return None
+        user = row.get("user") if isinstance(row.get("user"), dict) else row
+        uid = (
+            user.get("id")
+            or row.get("id")
+            or row.get("user_id")
+            or row.get("member_id")
+        )
+        if not uid:
+            return None
+        email = (user.get("email") or row.get("email") or "").lower().strip()
+        return {
+            "user_id": uid,
+            "email": email,
+            "name": user.get("name") or row.get("name") or "",
+            "role": row.get("role") or user.get("role") or "",
+            "status": row.get("status") or user.get("status") or "",
+            "raw": row,
+        }
 
-        Tries `/backend-api/accounts/{id}/users` with pagination.
-        Walks every page until `next_after`/`has_next` is empty.
-        Each row is normalised to {user_id, email, name, role, status, raw}.
-        """
+    def _list_members_page(self, *, offset: int, limit: int, query: str = "") -> tuple[list[dict], dict]:
+        """Single page of /users. Returns (rows, raw_body)."""
         self._require_account()
+        params = f"offset={offset}&limit={limit}&query={quote(query)}"
+        path = f"/backend-api/accounts/{self.account_id}/users?{params}"
+        r = self._request("GET", path, referer=f"{CHATGPT_BASE}/admin/members")
+        if r.status_code != 200:
+            raise Exception(f"list_members HTTP {r.status_code}: {(r.text or '')[:200]}")
+        try:
+            body = r.json() or {}
+        except Exception:
+            body = {}
+        rows_raw: Any = (
+            body.get("items")
+            or body.get("users")
+            or body.get("data")
+            or (body if isinstance(body, list) else [])
+        )
+        if not isinstance(rows_raw, list):
+            rows_raw = []
+        rows = [m for m in (self._normalize_member_row(r) for r in rows_raw) if m]
+        return rows, body if isinstance(body, dict) else {}
+
+    def list_members(self, *, query: str = "") -> list[dict[str, Any]]:
+        """List members of the master workspace, paging through all results.
+
+        Pass `query` to filter server-side by email/name (used by the fast-path
+        `find_user_id_by_email`). Without `query`, walks every offset until a
+        page returns fewer rows than `limit` (no more pages).
+        """
         out: list[dict[str, Any]] = []
         seen_ids: set = set()
-        after: str | None = None
-        max_pages = 20  # safety: 100 * 20 = 2000 members ceiling
+        offset = 0
+        max_pages = 30  # safety: 100 * 30 = 3000 ceiling
 
         for page in range(max_pages):
-            params: list[str] = [f"limit={self._MEMBER_PAGE_SIZE}"]
-            if after:
-                params.append(f"after={quote(after)}")
-            qs = "&".join(params)
-            path = f"/backend-api/accounts/{self.account_id}/users?{qs}"
-            r = self._request("GET", path, referer=f"{CHATGPT_BASE}/admin/members")
-            if r.status_code != 200:
-                raise Exception(f"list_members HTTP {r.status_code}: {(r.text or '')[:200]}")
-            try:
-                body = r.json() or {}
-            except Exception:
-                body = {}
-
-            # Find the rows array — chatgpt admin API has used `items` historically.
-            rows: Any = (
-                body.get("items")
-                or body.get("users")
-                or body.get("data")
-                or (body if isinstance(body, list) else [])
+            rows, body = self._list_members_page(
+                offset=offset, limit=self._MEMBER_PAGE_SIZE, query=query,
             )
-            if not isinstance(rows, list):
-                rows = []
-
+            if not rows:
+                break
             new_in_page = 0
-            for row in rows:
-                if not isinstance(row, dict):
+            for m in rows:
+                if m["user_id"] in seen_ids:
                     continue
-                user = row.get("user") if isinstance(row.get("user"), dict) else row
-                uid = user.get("id") or row.get("id") or row.get("user_id") or row.get("member_id")
-                if not uid or uid in seen_ids:
-                    continue
-                seen_ids.add(uid)
+                seen_ids.add(m["user_id"])
+                out.append(m)
                 new_in_page += 1
-                email = (user.get("email") or row.get("email") or "").lower().strip()
-                out.append(
-                    {
-                        "user_id": uid,
-                        "email": email,
-                        "name": user.get("name") or row.get("name") or "",
-                        "role": row.get("role") or user.get("role") or "",
-                        "status": row.get("status") or user.get("status") or "",
-                        "raw": row,
-                    }
-                )
-
-            # pagination cursor
-            next_after = (
-                body.get("next_after")
-                or body.get("next_cursor")
-                or body.get("cursor")
-                or ((body.get("page_info") or {}).get("end_cursor"))
-            )
-            has_next = body.get("has_next") or body.get("has_more")
-            if not new_in_page or (not next_after and not has_next):
+            # Stop conditions: short page, or server-reported total reached.
+            total = body.get("total") if isinstance(body, dict) else None
+            if len(rows) < self._MEMBER_PAGE_SIZE:
                 break
-            after = next_after if next_after else None
-            if not after:
+            if isinstance(total, int) and len(out) >= total:
                 break
+            if new_in_page == 0:
+                break
+            offset += self._MEMBER_PAGE_SIZE
 
-        logger.info("[master] list_members: 共 %d 个成员 (跨 %d 页)", len(out), page + 1)
+        logger.info(
+            "[master] list_members(query=%r): 共 %d 个成员 (跨 %d 页)",
+            query, len(out), page + 1,
+        )
         return out
 
     def find_user_id_by_email(self, email: str) -> str | None:
         """Email → user_id, case-insensitive. None if not found.
 
-        Logs the full member roster on miss so the user can debug what we
-        actually saw vs what's on screen.
+        Two-phase lookup:
+          1. Fast path: `?query=<email>` — chatgpt admin API filters server-side.
+          2. Fallback: full pagination, then exact match.
+
+        On miss, logs the first 20 members we saw so the user can compare
+        with what their admin UI shows.
         """
         target = (email or "").strip().lower()
         if not target:
             return None
+
+        # ---- fast path: ?query=email ----
+        try:
+            rows, _ = self._list_members_page(offset=0, limit=25, query=target)
+        except Exception as exc:
+            logger.warning("[master] query 快路径失败,fallback 全量分页: %s", exc)
+            rows = []
+        for m in rows:
+            if m.get("email") == target:
+                logger.info("[master] find_user_id_by_email: query 快路径命中 %s -> %s",
+                            target, m["user_id"])
+                return m["user_id"]
+        if rows:
+            logger.info(
+                "[master] find_user_id_by_email: query=%s 返回 %d 行但无精确匹配 — 进入全量",
+                target, len(rows),
+            )
+
+        # ---- slow path: full pagination ----
         members = self.list_members()
         for m in members:
             if m.get("email") == target:
-                return m.get("user_id")
-        # not found — dump for diagnosis
-        sample = [{"email": m.get("email"), "status": m.get("status"), "role": m.get("role")}
-                  for m in members[:20]]
+                return m["user_id"]
+
+        # Not found — dump for diagnosis.
+        sample = [
+            {"email": m.get("email"), "status": m.get("status"), "role": m.get("role")}
+            for m in members[:20]
+        ]
         logger.warning(
             "[master] find_user_id_by_email: 没找到 %s; 当前共 %d 个成员, 前 20 个: %s",
             target, len(members), sample,
