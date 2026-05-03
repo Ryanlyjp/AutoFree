@@ -221,7 +221,7 @@ def _run_round(
             "ok": False,
             "error": "",
         }
-        storage.update_cohort_member(run_id, email, **member)
+        storage.update_cohort_member(run_id, email, member)
 
         flow = Flow(proxy=proxy, tag=email.split("@")[0], mail_client=mail)
         flow.set_mail_context(mailbox_id)
@@ -242,7 +242,7 @@ def _run_round(
                 flow.close()
             except Exception:
                 pass
-            storage.update_cohort_member(run_id, email, **member)
+            storage.update_cohort_member(run_id, email, member)
         cohort.append(member)
 
     # Filter cohort to those that registered ok — they go through OAuth.
@@ -288,7 +288,7 @@ def _run_round(
                 flow.close()
             except Exception:
                 pass
-            storage.update_cohort_member(run_id, email, **member)
+            storage.update_cohort_member(run_id, email, member)
 
     # ---- 6. kick everyone in this cohort (regardless of OAuth success) ----
     storage.update_run(run_id, current_stage=STAGE_KICK)
@@ -309,7 +309,7 @@ def _run_round(
             member["error"] = (member.get("error") or "") + f"; kick: {exc}"
             summary["errors"].append({"email": email, "where": "kick", "msg": str(exc)})
             log(f"  ✗ kick 失败 {email}: {exc}", "error")
-        storage.update_cohort_member(run_id, email, **member)
+        storage.update_cohort_member(run_id, email, member)
 
     return summary
 

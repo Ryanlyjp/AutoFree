@@ -160,18 +160,30 @@ def append_log(run_id: str, line: str, level: str = "info") -> None:
         _write_run(rec)
 
 
-def update_cohort_member(run_id: str, email: str, **fields: Any) -> None:
+def update_cohort_member(run_id: str, email: str, fields: dict | None = None, /, **extra: Any) -> None:
+    """Insert-or-update one cohort entry, keyed by email.
+
+    Pass updates as the positional `fields` dict, or as keyword args, or both.
+    Keyword args override the dict on conflict. Any "email" key inside
+    `fields` / `extra` is silently dropped — the positional `email` always
+    wins, so the caller is free to splat a member dict that itself contains
+    its own "email" entry.
+    """
+    merged: dict[str, Any] = {}
+    if fields:
+        merged.update(fields)
+    merged.update(extra)
+    merged.pop("email", None)
     with _LOCK:
         rec = _read_run(run_id)
         if not rec:
             return
         for member in rec["cohort"]:
             if member.get("email") == email:
-                member.update(fields)
+                member.update(merged)
                 _write_run(rec)
                 return
-        # not found — append
-        rec["cohort"].append({"email": email, **fields})
+        rec["cohort"].append({"email": email, **merged})
         _write_run(rec)
 
 
