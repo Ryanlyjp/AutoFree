@@ -530,6 +530,27 @@ class Flow:
         self.p(f"  [OTP] ✓ {elapsed:.1f}s 内拿到验证码 {code}")
         return code
 
+    def _client_auth_session_dump(self, referer: str | None = None) -> dict[str, Any]:
+        """GET /api/accounts/client_auth_session_dump — browser calls this
+        between OAuth steps to advance server-side state machine.
+
+        Captured in auth.har between authorize/continue → email-otp/validate
+        and between email-otp/validate → workspace/select. Skipping it makes
+        the next POST 409 'Invalid session. Please start over.'
+        """
+        r = self._api_call(
+            "get",
+            f"{OAUTH_ISSUER}/api/accounts/client_auth_session_dump",
+            step="session-dump",
+            headers={
+                "Accept": "application/json",
+                "Referer": referer or getattr(self.page, "url", "") or f"{OAUTH_ISSUER}/log-in",
+                **self._std(),
+            },
+            max_redirects=0,
+        )
+        return r.get("json") or {}
+
     def _request_otp_resend(self, referer: str | None = None, *, why: str = "manual") -> int:
         self.p(f"  [OTP] → POST /api/accounts/email-otp/send (要求 OpenAI 发送 OTP, why={why})")
         r = self._api_call(
@@ -1349,18 +1370,28 @@ class Flow:
             final0 = r1["url"] or final0
 
         # 2/8 POST authorize/continue (username)
-        headers = self._json_headers(final0 if str(final0).startswith(OAUTH_ISSUER) else f"{OAUTH_ISSUER}/log-in", OAUTH_ISSUER)
-        token = self._resolve_sentinel_token("authorize_continue")
-        if token:
-            headers["openai-sentinel-token"] = token
-        r = self._api_call(
-            "post",
-            f"{OAUTH_ISSUER}/api/accounts/authorize/continue",
-            step="authorize-continue",
-            json_body={"username": {"kind": "email", "value": email}},
-            headers=headers,
-            max_redirects=0,
-        )
+        # Wrapped so we can retry from /oauth/authorize bootstrap on 409
+        # invalid_state. The chatgpt server requires very specific state
+        # progression — when our session cookies don't line up, it returns
+        # 409 and tells us to "start over".
+        def _do_authorize_continue() -> dict:
+            headers = self._json_headers(
+                final0 if str(final0).startswith(OAUTH_ISSUER) else f"{OAUTH_ISSUER}/log-in",
+                OAUTH_ISSUER,
+            )
+            tok = self._resolve_sentinel_token("authorize_continue")
+            if tok:
+                headers["openai-sentinel-token"] = tok
+            return self._api_call(
+                "post",
+                f"{OAUTH_ISSUER}/api/accounts/authorize/continue",
+                step="authorize-continue",
+                json_body={"username": {"kind": "email", "value": email}},
+                headers=headers,
+                max_redirects=0,
+            )
+
+        r = _do_authorize_continue()
         if r["status"] != 200:
             self.oauth_fail_reason = f"authorize/continue HTTP {r['status']}: {(r['text'] or '')[:200]}"
             self.p(f"[OAuth] ✗ {self.oauth_fail_reason}", "error")
@@ -1370,28 +1401,85 @@ class Flow:
         page_type = str(((data.get("page") or {}).get("type")) or "")
         self.p(f"[OAuth] step 2/8 ← page_type={page_type!r} next={next_url[:120]}")
 
-        # 3/8 password verify
-        self.p("[OAuth] step 3/8 — POST /api/accounts/password/verify")
-        headers = self._json_headers(f"{OAUTH_ISSUER}/log-in/password", OAUTH_ISSUER)
-        token = self._resolve_sentinel_token("password_verify")
-        if token:
-            headers["openai-sentinel-token"] = token
-        r = self._api_call(
-            "post",
-            f"{OAUTH_ISSUER}/api/accounts/password/verify",
-            step="password-verify",
-            json_body={"password": password},
-            headers=headers,
-            max_redirects=0,
+        # Browser-emulated state advance — auth.har shows /client_auth_session_dump
+        # called between every POST step. Skipping it leaves the server-side
+        # state machine on the previous step, causing 409 invalid_state when
+        # we POST the next thing.
+        self._client_auth_session_dump(referer=self._abs_auth_url(next_url) or final0)
+
+        # 3/8 password verify (CONDITIONAL — see auth.har: when the just-
+        # registered account is still "logged in" via chatgpt session cookies,
+        # authorize/continue's response immediately points at email-otp or
+        # consent without requiring password. Forcing password/verify in that
+        # state returns 409 invalid_state.)
+        need_password = (
+            page_type in ("login_password", "password", "log-in/password")
+            or "log-in/password" in next_url
+            or "/password" in next_url.lower()
         )
-        if r["status"] != 200:
-            self.oauth_fail_reason = f"password/verify HTTP {r['status']}: {(r['text'] or '')[:200]}"
-            self.p(f"[OAuth] ✗ {self.oauth_fail_reason}", "error")
-            return None
-        data = r["json"] or {}
-        next_url = str(data.get("continue_url") or next_url)
-        page_type = str(((data.get("page") or {}).get("type")) or page_type)
-        self.p(f"[OAuth] step 3/8 ← page_type={page_type!r} next={next_url[:120]}")
+        if need_password:
+            self.p("[OAuth] step 3/8 — POST /api/accounts/password/verify (page 要求 password)")
+            headers = self._json_headers(f"{OAUTH_ISSUER}/log-in/password", OAUTH_ISSUER)
+            token = self._resolve_sentinel_token("password_verify")
+            if token:
+                headers["openai-sentinel-token"] = token
+            r = self._api_call(
+                "post",
+                f"{OAUTH_ISSUER}/api/accounts/password/verify",
+                step="password-verify",
+                json_body={"password": password},
+                headers=headers,
+                max_redirects=0,
+            )
+
+            # 409 invalid_state retry: re-bootstrap once with fresh authorize.
+            if r["status"] == 409 and "invalid_state" in (r["text"] or ""):
+                self.p("[OAuth] ⚠ password/verify 409 invalid_state — 重 bootstrap 一次", "warning")
+                self._clear_oauth_continue()
+                self._prime_cookies()
+                self._sync_api_from_browser()
+                self._api_call(
+                    "get", authorize_url, step="oauth-authorize-retry",
+                    headers={
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Referer": f"{BASE}/", "Upgrade-Insecure-Requests": "1", **self._std(),
+                    },
+                    max_redirects=20,
+                )
+                r2 = _do_authorize_continue()
+                if r2["status"] == 200:
+                    data2 = r2["json"] or {}
+                    next_url = str(data2.get("continue_url") or next_url)
+                    page_type = str(((data2.get("page") or {}).get("type")) or page_type)
+                    self._client_auth_session_dump(referer=self._abs_auth_url(next_url))
+                    # retry password
+                    headers = self._json_headers(f"{OAUTH_ISSUER}/log-in/password", OAUTH_ISSUER)
+                    token = self._resolve_sentinel_token("password_verify")
+                    if token:
+                        headers["openai-sentinel-token"] = token
+                    r = self._api_call(
+                        "post",
+                        f"{OAUTH_ISSUER}/api/accounts/password/verify",
+                        step="password-verify-retry",
+                        json_body={"password": password},
+                        headers=headers,
+                        max_redirects=0,
+                    )
+
+            if r["status"] != 200:
+                self.oauth_fail_reason = f"password/verify HTTP {r['status']}: {(r['text'] or '')[:200]}"
+                self.p(f"[OAuth] ✗ {self.oauth_fail_reason}", "error")
+                return None
+            data = r["json"] or {}
+            next_url = str(data.get("continue_url") or next_url)
+            page_type = str(((data.get("page") or {}).get("type")) or page_type)
+            self.p(f"[OAuth] step 3/8 ← page_type={page_type!r} next={next_url[:120]}")
+            self._client_auth_session_dump(referer=self._abs_auth_url(next_url))
+        else:
+            self.p(
+                f"[OAuth] step 3/8 — **跳过 password/verify** "
+                f"(page_type={page_type!r} 表示 server 不需要密码,直接进下一步)"
+            )
 
         # 4/8 OAuth-stage OTP if page demands it (mail-driven)
         need_otp = page_type == "email_otp_verification" or "email-verification" in next_url or "email-otp" in next_url
@@ -1412,6 +1500,8 @@ class Flow:
                     page_type = str(((data.get("page") or {}).get("type")) or page_type)
                     self.last_otp_url = self._abs_auth_url(next_url or self.last_otp_url)
                     self.p(f"[OAuth]   ✓ OTP 通过, page_type={page_type!r} next={next_url[:120]}")
+                    # auth.har: GET /client_auth_session_dump after OTP validate
+                    self._client_auth_session_dump(referer=self.last_otp_url)
                     ok = True
                     break
                 self.p(f"[OAuth]   ✗ OTP 拒 status={r['status']}; resend + retry", "warning")

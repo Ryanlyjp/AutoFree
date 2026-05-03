@@ -408,12 +408,16 @@ class MasterClient:
     def find_user_id_by_email(self, email: str) -> str | None:
         """Email → user_id, case-insensitive. None if not found.
 
-        Two-phase lookup:
-          1. Fast path: `?query=<email>` — chatgpt admin API filters server-side.
-          2. Fallback: full pagination, then exact match.
+        Three-phase lookup:
+          1. Fast path: `?query=<email>` — chatgpt admin API filters server-side
+             (chatgpt-admin UI uses `query` for the "按姓名筛选" search box;
+             it also matches against email).
+          2. Slow path: full pagination then exact email match.
+          3. Last resort: substring match on local-part — handles cases where
+             the server normalises email differently (rare but cheap).
 
-        On miss, logs the first 20 members we saw so the user can compare
-        with what their admin UI shows.
+        On miss, dumps the **raw** first row so the user can see exactly what
+        chatgpt returns vs. what they expect. This is the kick debug net.
         """
         target = (email or "").strip().lower()
         if not target:
@@ -421,10 +425,10 @@ class MasterClient:
 
         # ---- fast path: ?query=email ----
         try:
-            rows, _ = self._list_members_page(offset=0, limit=25, query=target)
+            rows, body = self._list_members_page(offset=0, limit=25, query=target)
         except Exception as exc:
             logger.warning("[master] query 快路径失败,fallback 全量分页: %s", exc)
-            rows = []
+            rows, body = [], {}
         for m in rows:
             if m.get("email") == target:
                 logger.info("[master] find_user_id_by_email: query 快路径命中 %s -> %s",
@@ -432,8 +436,8 @@ class MasterClient:
                 return m["user_id"]
         if rows:
             logger.info(
-                "[master] find_user_id_by_email: query=%s 返回 %d 行但无精确匹配 — 进入全量",
-                target, len(rows),
+                "[master] query=%s 返回 %d 行但无精确匹配 (前几行 email: %s) — 进入全量",
+                target, len(rows), [m.get("email") for m in rows[:5]],
             )
 
         # ---- slow path: full pagination ----
@@ -442,15 +446,32 @@ class MasterClient:
             if m.get("email") == target:
                 return m["user_id"]
 
-        # Not found — dump for diagnosis.
+        # ---- last resort: substring match on local-part ----
+        local = target.split("@", 1)[0]
+        if local:
+            for m in members:
+                if local in (m.get("email") or ""):
+                    logger.warning(
+                        "[master] find_user_id_by_email: 精确匹配未中,但 local-part %r 在 %r 里匹配",
+                        local, m.get("email"),
+                    )
+                    return m["user_id"]
+
+        # Still not found — dump the raw row of the first member so the user
+        # can see what fields chatgpt actually returns (in case the API
+        # changed shape and we're parsing wrong keys).
         sample = [
-            {"email": m.get("email"), "status": m.get("status"), "role": m.get("role")}
+            {"email": m.get("email"), "status": m.get("status"),
+             "role": m.get("role"), "name": m.get("name"), "user_id": m.get("user_id")}
             for m in members[:20]
         ]
+        raw_first = members[0].get("raw") if members else None
         logger.warning(
-            "[master] find_user_id_by_email: 没找到 %s; 当前共 %d 个成员, 前 20 个: %s",
+            "[master] find_user_id_by_email: 没找到 %s; 当前共 %d 个成员, 前 20 个 normalised: %s",
             target, len(members), sample,
         )
+        if raw_first:
+            logger.warning("[master] 第 1 行原始 (debug): %s", raw_first)
         return None
 
     def kick_user_by_id(self, user_id: str) -> bool:
