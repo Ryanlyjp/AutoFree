@@ -80,26 +80,43 @@
 
 ## 30 秒上手
 
+### 方式 A：一键脚本（推荐）
+
 ```bash
-# 1. 安装
 cd AutoFree
-uv sync                          # 或 pip install -e .
-uv run playwright install chromium
-
-# 2. 前端构建（首次必跑;后端 fallback 到 JSON 提示）
-cd web && npm install && npm run build && cd ..
-
-# 3. 配 API Key（Web Bearer 鉴权）
-mkdir -p data && echo 'AUTOFREE_API_KEY=change-me' > data/.env
-
-# 4. 启动
-uv run autofree api              # http://0.0.0.0:8788
-
-# 5. 浏览器打开
-#    输入 API Key → Setup 配齐 (proxy / 邮箱后端 / CPA / 母号 token) → Run 启动
+bash setup.sh                  # uv sync + playwright install chromium + frontend build + 生成 .env
+uv run autofree api            # http://0.0.0.0:8788
 ```
 
-**完整一步步教程**：[docs/getting-started.md](docs/getting-started.md)
+### 方式 B：Docker
+
+```bash
+cd AutoFree
+docker compose up -d --build   # 自带 chromium + xvfb,首次 build 约 5 分钟
+# API key 在 data/.env(自动生成),用 `docker logs autofree | grep API_KEY` 看
+```
+
+### 方式 C：手动
+
+```bash
+cd AutoFree
+uv sync                                       # 或 pip install -e .
+uv run playwright install chromium            # ⚠️  必跑,否则 Flow.start() 会崩
+uv run playwright install-deps chromium       # Linux 装 chromium 系统依赖
+
+cd web && npm install && npm run build && cd ..
+
+mkdir -p data && echo 'AUTOFREE_API_KEY=change-me' > data/.env
+uv run autofree api
+```
+
+> ⚠️ **Playwright Chromium 不会自动装**。漏了这一步,启动 Run 任务时会报
+> `BrowserType.launch: Executable doesn't exist at /root/.cache/ms-playwright/...`
+> setup.sh 和 Dockerfile 都帮你做了;手动安装务必跑 `playwright install chromium`。
+
+启动后浏览器访问 `http://<host>:8788` → 输入 API Key → Setup 配齐 → Run 启动。
+
+**完整教程**：[docs/getting-started.md](docs/getting-started.md)
 
 ---
 
@@ -150,7 +167,11 @@ autofree set-account-id <id>          手动覆盖 master 的 workspace account_
 ```text
 AutoFree/
 ├── pyproject.toml
-├── .env.example                    复制成 data/.env，只需要 AUTOFREE_API_KEY
+├── setup.sh                        一键安装脚本(uv + playwright + npm + .env)
+├── Dockerfile                      容器镜像(自带 chromium + xvfb + 前端 build)
+├── docker-compose.yml              单服务编排,挂载 ./data
+├── docker-entrypoint.sh            启动时跑 xvfb + 自检关键 import
+├── .env.example                    复制成 data/.env,只需要 AUTOFREE_API_KEY
 ├── README.md                       本文档
 ├── docs/                           详细文档
 │   ├── getting-started.md          首次部署 + 跑通单号

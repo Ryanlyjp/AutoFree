@@ -243,14 +243,21 @@ class MailProvider(ABC):
     ) -> str:
         """Wait for an OTP-bearing email and return the 6-digit code.
 
-        Polls every EMAIL_POLL_INTERVAL seconds, checking each new email's
-        text/HTML/subject. Returns as soon as a matching code is found, even
-        if a non-OTP email arrived first.
+        Polls every EMAIL_POLL_INTERVAL seconds. Returns as soon as a matching
+        code is found. On timeout raises TimeoutError with diagnostic info
+        distinguishing "no email at all", "wrong sender", "regex miss".
         """
         timeout = timeout or EMAIL_POLL_TIMEOUT
-        deadline = time.time() + timeout
+        t0 = time.time()
+        deadline = t0 + timeout
         seen_ids: set = set()
+        seen_senders: list[str] = []
+        emails_total = 0
+        regex_misses = 0
+        polls = 0
+
         while time.time() < deadline:
+            polls += 1
             try:
                 emails = self.search_emails_by_recipient(to_email, size=10, account_id=account_id)
             except Exception as exc:
@@ -261,13 +268,28 @@ class MailProvider(ABC):
                 if eid in seen_ids:
                     continue
                 seen_ids.add(eid)
-                if sender_keyword:
-                    sender = str(em.get("sendEmail") or em.get("sender") or "").lower()
-                    if sender_keyword.lower() not in sender:
-                        continue
+                emails_total += 1
+                sender = str(em.get("sendEmail") or em.get("sender") or "").lower()
+                if sender and sender not in seen_senders:
+                    seen_senders.append(sender)
+                if sender_keyword and sender_keyword.lower() not in sender:
+                    continue
                 code = extract_otp_from_email(em)
                 if code:
-                    logger.info("[%s] OTP 命中: %s", self.provider_name, code)
+                    logger.info("[%s] OTP 命中 (poll #%d, %.1fs): %s from %s",
+                                self.provider_name, polls, time.time() - t0, code, sender)
                     return code
+                regex_misses += 1
             time.sleep(EMAIL_POLL_INTERVAL)
-        raise TimeoutError(f"等待 {to_email} OTP 超时 ({timeout}s)")
+
+        elapsed = time.time() - t0
+        diag = f"polls={polls} elapsed={elapsed:.1f}s emails_seen={emails_total}"
+        if seen_senders:
+            diag += f" senders={seen_senders[:5]}"
+        if emails_total == 0:
+            hint = "邮箱完全没收到邮件 — 检查 OpenAI 是否真的发了 (send-otp HTTP 200?), 域名 MX 是否正确, 是否被风控"
+        elif regex_misses == emails_total and sender_keyword:
+            hint = f"收到 {emails_total} 封邮件但没有 sender 含 {sender_keyword!r} — 可能是其它邮件混进了, 或 OpenAI 用了别的发件域"
+        else:
+            hint = "收到匹配的邮件但提取不到 6 位验证码 — 看邮件正文是不是被改成了链接形式"
+        raise TimeoutError(f"等待 {to_email} OTP 超时 ({elapsed:.1f}s, timeout={timeout}s) — {diag} | hint: {hint}")

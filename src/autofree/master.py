@@ -312,42 +312,106 @@ class MasterClient:
 
     # ---- members ----
 
+    # chatgpt admin /users supports limit/after pagination. Default page can be
+    # small (e.g. 20), so without paging a large team only sees the first page.
+    _MEMBER_PAGE_SIZE = 100
+
     def list_members(self) -> list[dict[str, Any]]:
-        """GET /backend-api/accounts/{account_id}/users — returns flat list of members."""
+        """List all members of the master workspace.
+
+        Tries `/backend-api/accounts/{id}/users` with pagination.
+        Walks every page until `next_after`/`has_next` is empty.
+        Each row is normalised to {user_id, email, name, role, status, raw}.
+        """
         self._require_account()
-        r = self._request("GET", f"/backend-api/accounts/{self.account_id}/users",
-                          referer=f"{CHATGPT_BASE}/admin/members")
-        if r.status_code != 200:
-            raise Exception(f"list_members HTTP {r.status_code}: {(r.text or '')[:200]}")
-        body = r.json() or {}
-        # Account-Owner endpoints typically wrap rows in `items` or `users`.
-        rows = body.get("items") or body.get("users") or body.get("data") or body
-        if not isinstance(rows, list):
-            rows = []
         out: list[dict[str, Any]] = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            user = row.get("user") or row
-            out.append(
-                {
-                    "user_id": user.get("id") or row.get("id") or row.get("user_id"),
-                    "email": (user.get("email") or row.get("email") or "").lower(),
-                    "name": user.get("name") or row.get("name") or "",
-                    "role": row.get("role") or user.get("role") or "",
-                    "status": row.get("status") or user.get("status") or "",
-                    "raw": row,
-                }
+        seen_ids: set = set()
+        after: str | None = None
+        max_pages = 20  # safety: 100 * 20 = 2000 members ceiling
+
+        for page in range(max_pages):
+            params: list[str] = [f"limit={self._MEMBER_PAGE_SIZE}"]
+            if after:
+                params.append(f"after={quote(after)}")
+            qs = "&".join(params)
+            path = f"/backend-api/accounts/{self.account_id}/users?{qs}"
+            r = self._request("GET", path, referer=f"{CHATGPT_BASE}/admin/members")
+            if r.status_code != 200:
+                raise Exception(f"list_members HTTP {r.status_code}: {(r.text or '')[:200]}")
+            try:
+                body = r.json() or {}
+            except Exception:
+                body = {}
+
+            # Find the rows array — chatgpt admin API has used `items` historically.
+            rows: Any = (
+                body.get("items")
+                or body.get("users")
+                or body.get("data")
+                or (body if isinstance(body, list) else [])
             )
+            if not isinstance(rows, list):
+                rows = []
+
+            new_in_page = 0
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                user = row.get("user") if isinstance(row.get("user"), dict) else row
+                uid = user.get("id") or row.get("id") or row.get("user_id") or row.get("member_id")
+                if not uid or uid in seen_ids:
+                    continue
+                seen_ids.add(uid)
+                new_in_page += 1
+                email = (user.get("email") or row.get("email") or "").lower().strip()
+                out.append(
+                    {
+                        "user_id": uid,
+                        "email": email,
+                        "name": user.get("name") or row.get("name") or "",
+                        "role": row.get("role") or user.get("role") or "",
+                        "status": row.get("status") or user.get("status") or "",
+                        "raw": row,
+                    }
+                )
+
+            # pagination cursor
+            next_after = (
+                body.get("next_after")
+                or body.get("next_cursor")
+                or body.get("cursor")
+                or ((body.get("page_info") or {}).get("end_cursor"))
+            )
+            has_next = body.get("has_next") or body.get("has_more")
+            if not new_in_page or (not next_after and not has_next):
+                break
+            after = next_after if next_after else None
+            if not after:
+                break
+
+        logger.info("[master] list_members: 共 %d 个成员 (跨 %d 页)", len(out), page + 1)
         return out
 
     def find_user_id_by_email(self, email: str) -> str | None:
+        """Email → user_id, case-insensitive. None if not found.
+
+        Logs the full member roster on miss so the user can debug what we
+        actually saw vs what's on screen.
+        """
         target = (email or "").strip().lower()
         if not target:
             return None
-        for m in self.list_members():
+        members = self.list_members()
+        for m in members:
             if m.get("email") == target:
                 return m.get("user_id")
+        # not found — dump for diagnosis
+        sample = [{"email": m.get("email"), "status": m.get("status"), "role": m.get("role")}
+                  for m in members[:20]]
+        logger.warning(
+            "[master] find_user_id_by_email: 没找到 %s; 当前共 %d 个成员, 前 20 个: %s",
+            target, len(members), sample,
+        )
         return None
 
     def kick_user_by_id(self, user_id: str) -> bool:
@@ -366,12 +430,17 @@ class MasterClient:
         logger.info("[master] kick user_id=%s ok=%s", user_id, ok)
         return ok
 
-    def kick_user_by_email(self, email: str) -> bool:
+    def kick_user_by_email(self, email: str) -> tuple[bool, str]:
+        """Returns (success, reason). reason is non-empty when success=False
+        so the runner can surface it to the run log."""
         uid = self.find_user_id_by_email(email)
         if not uid:
-            logger.warning("[master] kick_by_email: 找不到 %s 对应的 user_id", email)
-            return False
-        return self.kick_user_by_id(uid)
+            return False, f"在 master workspace 成员列表里找不到 {email} (可能被自动转去 personal 了, 或分页没拉全)"
+        try:
+            ok = self.kick_user_by_id(uid)
+        except Exception as exc:
+            return False, f"DELETE 调用失败: {exc}"
+        return (ok, "" if ok else "DELETE 返回 success=false")
 
     # ------------------------------------------------------------ helpers
 

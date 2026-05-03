@@ -1,0 +1,19 @@
+services:
+  autofree:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: autofree:latest
+    container_name: autofree
+    ports:
+      - "8788:8788"
+    volumes:
+      # Persist all runtime state (.env, settings.json, admin_state.json, auths/, runs/).
+      - ./data:/app/data
+    restart: unless-stopped
+    # Increase shm — Chromium occasionally needs more than the 64 MB default.
+    shm_size: "1gb"
+    # If you need outbound proxy from the host, set HTTP_PROXY env or
+    # configure proxy via /api/settings after the container starts (web UI).
+    environment:
+      - PYTHONUNBUFFERED=1

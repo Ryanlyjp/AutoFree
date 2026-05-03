@@ -6,6 +6,49 @@
 
 ## 安装阶段
 
+### `BrowserType.launch: Executable doesn't exist at /root/.cache/ms-playwright/...`
+
+完整报文：
+
+```
+playwright._impl._errors.Error: BrowserType.launch: Executable doesn't exist at
+/root/.cache/ms-playwright/chromium_headless_shell-1217/chrome-headless-shell-linux64/chrome-headless-shell
+╔════════════════════════════════════════════════════════════╗
+║ Looks like Playwright was just installed or updated.       ║
+║ Please run the following command to download new browsers: ║
+║                                                            ║
+║     playwright install                                     ║
+```
+
+**根因**：`pip install playwright` 只装了 Python 库,**没** 下浏览器二进制。Playwright 把 chromium 装在 `~/.cache/ms-playwright/` 下,需要单独触发。
+
+**修法**:
+
+```bash
+# 裸装
+uv run playwright install chromium
+uv run playwright install-deps chromium    # Linux: 装 chromium 的系统 .so 依赖
+
+# 或者直接跑一键脚本(推荐)
+bash setup.sh
+
+# 国内下载慢:
+PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright \
+    uv run playwright install chromium
+```
+
+**Docker 用户**:Dockerfile 已经在镜像 build 阶段装好了。如果你看到这个错,说明:
+
+1. 你启动的不是 `docker compose up` 而是裸跑 host 上的 autofree —— 走 `bash setup.sh`
+2. 或者你魔改了 Dockerfile 移除了 `playwright install` 行 —— 加回来重 build:
+   ```bash
+   docker compose down
+   docker compose build --no-cache
+   docker compose up -d
+   ```
+
+**容器是隔离的**,不会复用宿主机的 playwright/chromium,**必须** 在镜像 build 时就装。
+
 ### `playwright install chromium` 慢 / 卡
 
 国内网络问题。换源：

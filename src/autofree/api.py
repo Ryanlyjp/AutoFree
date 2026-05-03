@@ -276,9 +276,10 @@ def master_kick(req: KickReq) -> dict[str, Any]:
         client = master.get_default_client()
         if req.user_id:
             ok = client.kick_user_by_id(req.user_id)
+            return {"ok": ok, "reason": "" if ok else "kick_user_by_id 返回 success=false"}
         else:
-            ok = client.kick_user_by_email(req.email or "")
-        return {"ok": ok}
+            ok, reason = client.kick_user_by_email(req.email or "")
+            return {"ok": ok, "reason": reason}
     except master.MasterAuthError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:

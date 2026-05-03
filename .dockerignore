@@ -1,0 +1,13 @@
+# keep image small + don't leak local secrets
+data/
+.git/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+node_modules/
+web/dist/
+src/autofree/web/dist/
+.env
+*.log

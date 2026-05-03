@@ -178,12 +178,23 @@ class Flow:
         headless: bool = PLAYWRIGHT_HEADLESS_DEFAULT,
         mail_client: MailProvider | None = None,
         otp_timeout: int = EMAIL_POLL_TIMEOUT,
+        log_emitter=None,
+        master_account_id: str | None = None,
     ):
         self.tag = tag
         self.proxy = _normalize_proxy(proxy)
         self.headless = bool(headless)
         self.mail_client = mail_client
         self.otp_timeout = int(otp_timeout)
+        # Callback (line: str, level: str) -> None for surfacing per-step
+        # progress to the run log so the web UI shows fine-grained detail.
+        self.log_emitter = log_emitter
+        # The master Team workspace id — used to *exclude* it when picking
+        # personal in OAuth; the personal workspace is "the other one".
+        self.master_account_id = (master_account_id or "").strip().lower() or None
+        # Recorded by oauth_personal so the runner can show why we couldn't
+        # finish (workspace missing, OTP timeout, consent stuck, ...).
+        self.oauth_fail_reason: str = ""
 
         self.device_id = str(uuid.uuid4())
         self.auth_session_logging_id = str(uuid.uuid4())
@@ -219,9 +230,16 @@ class Flow:
 
     # ============================================================ public
 
-    def p(self, msg: str) -> None:
+    def p(self, msg: str, level: str = "info") -> None:
         prefix = f"[{self.tag}] " if self.tag else ""
-        logger.info("%s%s", prefix, msg)
+        line = prefix + msg
+        getattr(logger, level if level in ("debug", "info", "warning", "error") else "info")(line)
+        # Mirror to run log so the web UI shows step-by-step.
+        if self.log_emitter:
+            try:
+                self.log_emitter(line, level)
+            except Exception:
+                pass
 
     def set_mail_context(self, mailbox_id: int | str | None) -> None:
         """Tell the flow which mailbox to poll for OTPs.
@@ -475,24 +493,49 @@ class Flow:
     # ============================================================ OTP plumbing (via mail_client)
 
     def _wait_otp(self, email: str) -> str:
-        """Pull the next OTP for `email` from the mail backend."""
+        """Pull the next OTP for `email` from the mail backend.
+
+        Logs which mailbox id we're polling and how long the timeout is, so
+        the run log clearly distinguishes "OTP not arrived" from "OTP wrong"
+        from "code wasn't extracted".
+        """
         if not self.mail_client:
             raise FlowError("Flow.mail_client 未注入,无法拉 OTP")
-        code = self.mail_client.wait_for_otp(
-            email,
-            timeout=self.otp_timeout,
-            sender_keyword="openai",
-            account_id=self._mailbox_id,
+        provider = getattr(self.mail_client, "provider_name", "?")
+        self.p(
+            f"  [OTP] 开始轮询邮箱后端({provider}) target={email} "
+            f"mailbox_id={self._mailbox_id} timeout={self.otp_timeout}s"
         )
+        t0 = time.time()
+        try:
+            code = self.mail_client.wait_for_otp(
+                email,
+                timeout=self.otp_timeout,
+                sender_keyword="openai",
+                account_id=self._mailbox_id,
+            )
+        except TimeoutError as exc:
+            elapsed = time.time() - t0
+            self.p(
+                f"  [OTP] ✗ 等了 {elapsed:.1f}s 仍未拿到 OTP — {exc}。"
+                " 可能原因: ① OpenAI 没发邮件(检查 send_otp 状态码) "
+                "② 域名 MX 没指向后端 ③ OpenAI 标黑此 IP/域 ④ 后端 OTP 提取正则没匹配",
+                "error",
+            )
+            raise
+        elapsed = time.time() - t0
         if not (isinstance(code, str) and re.fullmatch(r"\d{6}", code)):
+            self.p(f"  [OTP] ✗ 后端返回非 6 位 OTP: {code!r}", "error")
             raise FlowError(f"mail backend 返回非 6 位 OTP: {code!r}")
+        self.p(f"  [OTP] ✓ {elapsed:.1f}s 内拿到验证码 {code}")
         return code
 
-    def _request_otp_resend(self, referer: str | None = None) -> int:
+    def _request_otp_resend(self, referer: str | None = None, *, why: str = "manual") -> int:
+        self.p(f"  [OTP] → POST /api/accounts/email-otp/send (要求 OpenAI 发送 OTP, why={why})")
         r = self._api_call(
             "get",
             f"{AUTH}/api/accounts/email-otp/send",
-            step="OTP Resend",
+            step="OTP Send",
             headers={
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Referer": referer or getattr(self.page, "url", "") or f"{AUTH}/email-verification",
@@ -501,6 +544,15 @@ class Flow:
             },
         )
         self.last_otp_url = self._abs_auth_url(r["url"]) or self.last_otp_url
+        if r["status"] == 200:
+            self.p(f"  [OTP] ✓ OpenAI 已接受 send 请求(HTTP 200),邮件应该数秒内到达")
+        else:
+            preview = (r.get("text") or "")[:200]
+            self.p(
+                f"  [OTP] ⚠ send-otp HTTP {r['status']}: {preview!r} "
+                f"— 这通常意味着 OpenAI 拒绝下发 OTP(IP 风控/账号异常)",
+                "warning",
+            )
         return r["status"]
 
     # ============================================================ Sentinel
@@ -739,30 +791,42 @@ class Flow:
 
     def run_register(self, email: str, password: str, name: str, birthdate: str) -> None:
         """Drive the gpt.har register flow end-to-end (no Team join — AP is off)."""
+        self.p(f"[register] === 开始注册 {email} ===")
+        self.p("[register] step 1/7 — GET chatgpt.com 首页 (拿初始 cookies)")
         self._visit_homepage()
+        self.p("[register] step 2/7 — GET /api/auth/csrf")
         csrf = self._get_csrf()
+        self.p(f"[register] step 3/7 — POST /api/auth/signin/openai (login_hint={email})")
         auth_url = self._signin(email, csrf)
+        self.p(f"[register] step 4/7 — GET authorize URL → 走到登录/注册页")
         final = self._authorize(auth_url)
         path = urlparse(final).path.lower()
+        self.p(f"[register] 当前路径: {path}")
 
         need_otp = False
         if "create-account/password" in path:
-            self.p("[register] password page — submitting credential")
+            self.p("[register] step 5/7 — POST /api/accounts/user/register (提交邮箱+密码)")
             status, data = self._register(email, password)
             if status != 200:
+                self.p(f"[register] ✗ register HTTP {status}: {data}", "error")
                 raise FlowError(f"register failed: {data}")
+            self.p(f"[register] ✓ 注册账号已创建,接下来要求 OpenAI 发 OTP")
+            self.p("[register] step 6/7 — 触发 send-otp")
             self._send_otp()
             need_otp = True
         elif "email-verification" in path or "email-otp" in path:
+            self.p("[register] 路径直接进 OTP 验证页(账号或已存在),走 OTP 分支")
             need_otp = True
         elif "about-you" in path:
+            self.p("[register] 路径直接进 about-you 页,跳过 OTP 直接 create_account")
             status, data = self._create_account(name, birthdate)
             if status != 200:
                 raise FlowError(f"create_account failed: {data}")
             self._consume_callback()
+            self.p(f"[register] === ✓ 注册完成 {email} (无 OTP 路径) ===")
             return
         else:
-            self.p(f"[register] fallback path: {final}")
+            self.p(f"[register] 未识别路径,fallback 走 register: {final}", "warning")
             status, data = self._register(email, password)
             if status != 200:
                 raise FlowError(f"register fallback failed: {data}")
@@ -771,28 +835,32 @@ class Flow:
 
         if need_otp:
             self.last_otp_url = self.last_otp_url or f"{AUTH}/email-verification"
-            self.p(f"[register] 等待邮箱 OTP for {email}")
+            self.p(f"[register] step 6/7 — 等待邮箱 OTP for {email} (最多 3 次)")
             ok = False
             last: dict = {}
             for i in range(3):
+                self.p(f"[register]   OTP try {i+1}/3 — 等邮件...")
                 code = self._wait_otp(email)
-                self.p(f"[register] OTP try {i+1}/3 -> {code}")
+                self.p(f"[register]   提交 code={code} 到 /api/accounts/email-otp/validate")
                 status, data = self._validate_register_otp(code)
                 last = data
                 if status == 200:
+                    self.p(f"[register]   ✓ OTP 验证通过")
                     ok = True
                     break
-                # OTP wrong / consumed — request resend, then poll fresh
-                self.p(f"[register] OTP rejected, status={status}; resend + retry")
-                self._request_otp_resend()
+                self.p(f"[register]   ✗ OTP 验证失败 status={status} body={data}; 重发后重试", "warning")
+                self._request_otp_resend(why=f"validate-failed-{status}")
                 time.sleep(2)
             if not ok:
                 raise FlowError(f"register OTP validate failed: {last}")
 
+        self.p("[register] step 7/7 — POST /api/accounts/create_account (生日 + 姓名)")
         status, data = self._create_account(name, birthdate)
         if status != 200:
+            self.p(f"[register] ✗ create_account HTTP {status}: {data}", "error")
             raise FlowError(f"create_account failed: {data}")
         self._consume_callback()
+        self.p(f"[register] === ✓ 注册完成 {email} ===")
 
     # ============================================================ OAuth flow (auth.har)
 
@@ -868,32 +936,66 @@ class Flow:
     # ---- workspace selection (PERSONAL ONLY) ----
 
     def _select_personal_workspace(self, consent_url: str) -> str | None:
-        """Decode oai-client-auth-session, find a personal workspace, POST select."""
+        """Decode oai-client-auth-session, find a personal workspace, POST select.
+
+        Selection priority:
+          1. Heuristic match (`structure ∈ personal_*` / `plan_type=free` / `is_personal=True`)
+          2. The workspace whose id is NOT the master Team account_id (when known)
+          3. Pick the *last* workspace — UI shows Team first, Personal second
+        Logs every workspace it sees so the user can debug if all 3 paths miss.
+        """
         session = self._decode_oauth_session()
         if not session:
-            self.p("[OAuth] missing oai-client-auth-session — cannot select workspace")
+            self.p("[OAuth][ws] ✗ 找不到 oai-client-auth-session cookie — 没法选 workspace", "error")
             return None
         workspaces = session.get("workspaces") or []
         if not isinstance(workspaces, list) or not workspaces:
-            self.p("[OAuth] workspaces[] empty in session cookie")
+            self.p("[OAuth][ws] ✗ session cookie 里 workspaces[] 为空", "error")
             return None
 
+        # Always print the bundle so the user can see what we're picking from.
+        for i, w in enumerate(workspaces):
+            if not isinstance(w, dict):
+                continue
+            self.p(
+                f"[OAuth][ws] 候选 [{i}] id={w.get('id')} "
+                f"structure={w.get('structure')!r} plan_type={w.get('plan_type')!r} "
+                f"is_personal={w.get('is_personal')!r} name={w.get('name') or w.get('workspace_name')!r}"
+            )
+
+        personal = None
+        reason = ""
+
+        # ① heuristic
         personal = next((w for w in workspaces if _is_personal_workspace(w)), None)
+        if personal:
+            reason = "heuristic-match"
+
+        # ② not master
+        if not personal and self.master_account_id:
+            for w in workspaces:
+                if isinstance(w, dict) and str(w.get("id") or "").lower() != self.master_account_id:
+                    personal = w
+                    reason = f"not-master ({w.get('id')} ≠ master {self.master_account_id[:8]}...)"
+                    break
+
+        # ③ last entry — UI shows Team first, Personal/个人空间 second
+        if not personal:
+            personal = workspaces[-1] if isinstance(workspaces[-1], dict) else None
+            if personal:
+                reason = f"last-entry-fallback (workspaces[{len(workspaces)-1}])"
+
         if not personal or not personal.get("id"):
             visible = [
-                {
-                    "id": str(w.get("id"))[:8] + "...",
-                    "structure": w.get("structure"),
-                    "plan_type": w.get("plan_type"),
-                    "is_personal": w.get("is_personal"),
-                }
-                for w in workspaces
-                if isinstance(w, dict)
+                {"id": w.get("id"), "structure": w.get("structure"),
+                 "plan_type": w.get("plan_type"), "is_personal": w.get("is_personal")}
+                for w in workspaces if isinstance(w, dict)
             ]
+            self.p(f"[OAuth][ws] ✗ 三轮筛选都没找到 personal — bundle={visible}", "error")
             raise FlowError(f"OAuth workspaces[] 中无 personal 选项: {visible}")
 
         ws_id = personal["id"]
-        self.p(f"[OAuth] selecting personal workspace id={ws_id}")
+        self.p(f"[OAuth][ws] ✓ 选中 workspace_id={ws_id} (策略: {reason})")
         headers = self._json_headers(consent_url, OAUTH_ISSUER)
         r = self._api_call(
             "post",
@@ -1117,8 +1219,11 @@ class Flow:
 
     def oauth_personal(self, email: str, password: str) -> dict[str, Any] | None:
         """Codex OAuth flow forcing personal-workspace selection.
-        Returns {access_token, refresh_token, id_token, ...} on success, None on failure."""
-        self.p("[OAuth] start (personal-forced)")
+        Returns {access_token, refresh_token, id_token, ...} on success, None on failure.
+        Failure reason recorded in self.oauth_fail_reason for runner to surface.
+        """
+        self.oauth_fail_reason = ""
+        self.p(f"[OAuth] === 开始 OAuth {email} (强制选 personal workspace) ===")
         self._clear_oauth_continue()
         self._prime_cookies()
         self._sync_api_from_browser()
@@ -1185,13 +1290,16 @@ class Flow:
             max_redirects=0,
         )
         if r["status"] != 200:
-            self.p(f"[OAuth] authorize/continue {r['status']}: {(r['text'] or '')[:200]}")
+            self.oauth_fail_reason = f"authorize/continue HTTP {r['status']}: {(r['text'] or '')[:200]}"
+            self.p(f"[OAuth] ✗ {self.oauth_fail_reason}", "error")
             return None
         data = r["json"] or {}
         next_url = str(data.get("continue_url") or "")
         page_type = str(((data.get("page") or {}).get("type")) or "")
+        self.p(f"[OAuth] step 2/8 ← page_type={page_type!r} next={next_url[:120]}")
 
         # 3/8 password verify
+        self.p("[OAuth] step 3/8 — POST /api/accounts/password/verify")
         headers = self._json_headers(f"{OAUTH_ISSUER}/log-in/password", OAUTH_ISSUER)
         token = self._resolve_sentinel_token("password_verify")
         if token:
@@ -1205,44 +1313,54 @@ class Flow:
             max_redirects=0,
         )
         if r["status"] != 200:
-            self.p(f"[OAuth] password/verify {r['status']}: {(r['text'] or '')[:200]}")
+            self.oauth_fail_reason = f"password/verify HTTP {r['status']}: {(r['text'] or '')[:200]}"
+            self.p(f"[OAuth] ✗ {self.oauth_fail_reason}", "error")
             return None
         data = r["json"] or {}
         next_url = str(data.get("continue_url") or next_url)
         page_type = str(((data.get("page") or {}).get("type")) or page_type)
+        self.p(f"[OAuth] step 3/8 ← page_type={page_type!r} next={next_url[:120]}")
 
         # 4/8 OAuth-stage OTP if page demands it (mail-driven)
         need_otp = page_type == "email_otp_verification" or "email-verification" in next_url or "email-otp" in next_url
         if need_otp:
             self.last_otp_url = self._abs_auth_url(next_url or f"{OAUTH_ISSUER}/email-verification")
-            self.p(f"[OAuth] OTP gate -> {self.last_otp_url}")
+            self.p(f"[OAuth] step 4/8 — OAuth 阶段需要二次 OTP @ {self.last_otp_url}")
             ok = False
+            last_status = 0
             for i in range(3):
+                self.p(f"[OAuth]   OTP try {i+1}/3 — 等邮件...")
                 code = self._wait_otp(email)
-                self.p(f"[OAuth] OTP try {i+1}/3 -> {code}")
+                self.p(f"[OAuth]   提交 code={code}")
                 r = self._oauth_validate_otp(code)
+                last_status = r["status"]
                 if r["status"] == 200:
                     data = r["json"] or {}
                     next_url = str(data.get("continue_url") or next_url)
                     page_type = str(((data.get("page") or {}).get("type")) or page_type)
                     self.last_otp_url = self._abs_auth_url(next_url or self.last_otp_url)
+                    self.p(f"[OAuth]   ✓ OTP 通过, page_type={page_type!r} next={next_url[:120]}")
                     ok = True
                     break
-                self.p(f"[OAuth] OTP rejected, status={r['status']}; resend")
-                self._request_otp_resend()
+                self.p(f"[OAuth]   ✗ OTP 拒 status={r['status']}; resend + retry", "warning")
+                self._request_otp_resend(why=f"oauth-otp-{r['status']}")
                 time.sleep(2)
             if not ok:
-                self.p("[OAuth] OTP exhausted")
+                self.oauth_fail_reason = f"OAuth 二次 OTP 3 次都失败 (last status={last_status})"
+                self.p(f"[OAuth] ✗ {self.oauth_fail_reason}", "error")
                 return None
+        else:
+            self.p("[OAuth] step 4/8 — 不需要 OAuth 二次 OTP, 直接进 consent")
 
         # 5/8 consent / workspace / organization → authorization code
+        self.p("[OAuth] step 5/8 — consent + workspace 选择 (强制 personal)")
         consent_url = next_url
         if consent_url.startswith("/"):
             consent_url = f"{OAUTH_ISSUER}{consent_url}"
         code = _extract_code(consent_url) if consent_url else None
 
         if not code and consent_url:
-            code = self._follow_for_code(consent_url, referer=f"{OAUTH_ISSUER}/log-in/password")[0]
+            code, _ = self._follow_for_code(consent_url, referer=f"{OAUTH_ISSUER}/log-in/password")
 
         consent_hint = (
             ("consent" in (consent_url or ""))
@@ -1256,10 +1374,17 @@ class Flow:
         if not code:
             code = self._resolve_code_from_consent("", referer=f"{OAUTH_ISSUER}/log-in/password")
         if not code:
-            self.p("[OAuth] no authorization code after consent — give up")
+            self.oauth_fail_reason = (
+                "consent 后没拿到 authorization code — 可能是 workspace[] 里没 personal "
+                "(auto_provision 没生效?), 或者 consent 被 add-phone gate 拦截。"
+                " 翻上面的 [OAuth][ws] 候选日志。"
+            )
+            self.p(f"[OAuth] ✗ {self.oauth_fail_reason}", "error")
             return None
+        self.p(f"[OAuth] step 5/8 ✓ 拿到 code={code[:12]}...")
 
         # 6/8 exchange code for tokens
+        self.p("[OAuth] step 6/8 — POST /oauth/token (用 code 换 access/refresh/id)")
         r = self._api_call(
             "post",
             f"{OAUTH_ISSUER}/oauth/token",
@@ -1275,9 +1400,10 @@ class Flow:
         )
         data = r["json"] or {}
         if r["status"] != 200 or not data.get("access_token"):
-            self.p(f"[OAuth] token exchange failed {r['status']}: {(r['text'] or '')[:200]}")
+            self.oauth_fail_reason = f"oauth/token HTTP {r['status']}: {(r['text'] or '')[:200]}"
+            self.p(f"[OAuth] ✗ {self.oauth_fail_reason}", "error")
             return None
-        self.p("[OAuth] success — got access_token")
+        self.p("[OAuth] === ✓ OAuth 完成,拿到 access_token + refresh_token ===")
         return data
 
 

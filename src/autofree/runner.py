@@ -223,7 +223,10 @@ def _run_round(
         }
         storage.update_cohort_member(run_id, email, member)
 
-        flow = Flow(proxy=proxy, tag=email.split("@")[0], mail_client=mail)
+        flow = Flow(
+            proxy=proxy, tag=email.split("@")[0], mail_client=mail,
+            log_emitter=log, master_account_id=master_client.account_id,
+        )
         flow.set_mail_context(mailbox_id)
         try:
             flow.start()
@@ -267,13 +270,17 @@ def _run_round(
 
         email = member["email"]
         log(f"[Round {round_index}] step 5/6 — OAuth {i}/{len(successes)} {email}")
-        flow = Flow(proxy=proxy, tag=email.split("@")[0], mail_client=mail)
+        flow = Flow(
+            proxy=proxy, tag=email.split("@")[0], mail_client=mail,
+            log_emitter=log, master_account_id=master_client.account_id,
+        )
         flow.set_mail_context(member.get("mailbox_id"))
         try:
             flow.start()
             tokens = flow.oauth_personal(email, member["password"])
             if not tokens or not tokens.get("access_token"):
-                raise RuntimeError("oauth_personal 返回空 token")
+                reason = flow.oauth_fail_reason or "oauth_personal 返回空 token (无具体原因)"
+                raise RuntimeError(reason)
             cpa_push.save_and_register(email, tokens, extra={"run_id": run_id, "round": round_index})
             member["stage"] = "oauthed"
             summary["oauthed"] += 1
@@ -296,19 +303,20 @@ def _run_round(
         email = member["email"]
         log(f"[Round {round_index}] step 6/6 — kick {i}/{len(cohort)} {email}")
         try:
-            ok = master_client.kick_user_by_email(email)
+            ok, reason = master_client.kick_user_by_email(email)
             if ok:
                 member["kicked"] = True
                 summary["kicked"] += 1
                 log(f"  ✓ kicked {email}")
             else:
                 member["kicked"] = False
-                log(f"  ⚠ kick 未找到 {email}", "warning")
+                summary["errors"].append({"email": email, "where": "kick", "msg": reason})
+                log(f"  ⚠ kick 失败 {email}: {reason}", "warning")
         except Exception as exc:
             member["kicked"] = False
             member["error"] = (member.get("error") or "") + f"; kick: {exc}"
             summary["errors"].append({"email": email, "where": "kick", "msg": str(exc)})
-            log(f"  ✗ kick 失败 {email}: {exc}", "error")
+            log(f"  ✗ kick 异常 {email}: {exc}", "error")
         storage.update_cohort_member(run_id, email, member)
 
     return summary

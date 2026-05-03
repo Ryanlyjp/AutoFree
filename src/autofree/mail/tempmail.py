@@ -221,24 +221,78 @@ class TempmailClient(MailProvider):
     # ---- fast OTP path: tempmail does server-side extraction
 
     def wait_for_otp(self, to_email, timeout=None, sender_keyword="openai", account_id=None):
+        """Server-side OTP fast path.
+
+        Polls `/api/mailboxes/:id/otp/latest` until it returns a code that
+        matches `sender_keyword`. If the entire `timeout` elapses without a
+        hit, falls back to the base regex pipeline for **the same total
+        budget remaining** (originally was a misleading 5s).
+
+        Raises TimeoutError with an actionable diagnostic that distinguishes:
+          - 404 throughout → no email ever arrived (most likely OpenAI didn't
+            send, or your domain MX isn't pointing at this backend)
+          - 200 with non-matching sender → emails arrived but none from openai
+          - 422 (otp not found) → emails from openai arrived but server's
+            extractor couldn't pull a 6-digit code (regex miss)
+        """
         timeout = timeout or EMAIL_POLL_TIMEOUT
         real_id = self._resolve_id(account_id) if account_id else self._resolve_id(to_email)
         if not real_id:
+            logger.warning("[tempmail] wait_for_otp: 找不到 mailbox id for %s, 走 base.search 路径", to_email)
             return super().wait_for_otp(to_email, timeout=timeout, sender_keyword=sender_keyword, account_id=account_id)
-        deadline = time.time() + timeout
+
+        t0 = time.time()
+        deadline = t0 + timeout
+        seen_status: dict[int, int] = {}  # status_code -> count
+        seen_senders: list[str] = []
+        last_otp_code: str | None = None
+        last_otp_sender: str = ""
+        polls = 0
+
         while time.time() < deadline:
+            polls += 1
             try:
                 r = self._get(f"/api/mailboxes/{real_id}/otp/latest")
             except Exception as exc:
                 logger.warning("[tempmail] otp/latest 异常: %s", exc)
-                r = None
-            if r is not None and r.status_code == 200:
+                time.sleep(EMAIL_POLL_INTERVAL)
+                continue
+            seen_status[r.status_code] = seen_status.get(r.status_code, 0) + 1
+
+            if r.status_code == 200:
                 otp = ((r.json() or {}).get("otp") or {})
                 code = otp.get("code")
                 sender = str(otp.get("sender") or "").lower()
+                last_otp_code = code
+                last_otp_sender = sender
+                if sender and sender not in seen_senders:
+                    seen_senders.append(sender)
                 if code and (not sender_keyword or sender_keyword.lower() in sender):
-                    logger.info("[tempmail] OTP 命中: %s", code)
+                    logger.info("[tempmail] OTP 命中 (poll #%d, %.1fs): %s from %s", polls, time.time() - t0, code, sender)
                     return code
+
             time.sleep(EMAIL_POLL_INTERVAL)
-        # fallback to base regex pipeline if server endpoint never matched
-        return super().wait_for_otp(to_email, timeout=5, sender_keyword=sender_keyword, account_id=real_id)
+
+        # Timeout. Build a diagnostic.
+        elapsed = time.time() - t0
+        diag_parts = [f"polls={polls} elapsed={elapsed:.1f}s"]
+        diag_parts.append("server_responses=" + ",".join(f"{k}:{v}" for k, v in sorted(seen_status.items())))
+        if seen_senders:
+            diag_parts.append(f"saw_senders={seen_senders[:5]}")
+        if last_otp_code:
+            diag_parts.append(
+                f"last_email_had_code_but_sender={last_otp_sender!r}_!~_{sender_keyword!r}"
+            )
+        diag = " | ".join(diag_parts)
+
+        # Hint based on what we actually saw.
+        if seen_status.get(404, 0) == polls:
+            hint = "全程 404 — 邮箱从未收到任何邮件。检查 OpenAI 是否真的发了 (send-otp HTTP 200?), 域名 MX 是否指向 tempmail, 是否被 OpenAI 标黑"
+        elif last_otp_code and sender_keyword and sender_keyword.lower() not in last_otp_sender:
+            hint = f"邮件到了但发件人 ({last_otp_sender}) 不含 {sender_keyword!r} — 可能不是 OpenAI 发的, 或 OpenAI 用了别的域名"
+        elif seen_status.get(422, 0) > 0:
+            hint = "tempmail server 拿到邮件但 OTP 提取失败 (422). 看邮件原文是不是 6 位数字格式"
+        else:
+            hint = "看上面 server_responses 分布"
+
+        raise TimeoutError(f"等待 {to_email} OTP 超时 ({elapsed:.1f}s, timeout={timeout}s) — {diag} | hint: {hint}")

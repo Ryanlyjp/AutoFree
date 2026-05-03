@@ -28,31 +28,70 @@
 
 ## 2. 安装
 
-### 方式 A：uv（推荐）
+### 方式 A：一键脚本（推荐）
+
+```bash
+git clone <your-fork-or-mirror-url> AutoFree
+cd AutoFree
+bash setup.sh
+```
+
+`setup.sh` 做这些事:
+1. 装 xvfb + 中文字体 (Linux 用 sudo apt-get)
+2. 装 uv (没有的话)
+3. `uv sync`
+4. **`playwright install chromium`** + `install-deps chromium` ← 关键,漏了 Run 会崩
+5. 生成 `data/.env` 含随机 API key
+6. `npm install && npm run build` 前端 (npm 没装则跳过)
+
+### 方式 B：Docker
+
+```bash
+git clone <your-fork-or-mirror-url> AutoFree
+cd AutoFree
+docker compose up -d --build
+# 首次 build ~5 分钟(下 chromium + npm install)
+# 数据卷挂在 ./data,持久化
+# 看自动生成的 API key:
+docker compose logs autofree | grep AUTOFREE_API_KEY
+```
+
+容器自带:Python 3.12 + uv + Chromium + xvfb + Node + 前端 build 产物。
+**不会** 复用宿主机的 playwright/chromium —— 容器是独立 fs,需要自己安装(Dockerfile 已包)。
+
+### 方式 C：纯手动 uv
 
 ```bash
 git clone <your-fork-or-mirror-url> AutoFree
 cd AutoFree
 uv sync
-uv run playwright install chromium
+uv run playwright install chromium                    # ⚠️ 必跑
+uv run playwright install-deps chromium               # Linux 装 chromium 系统依赖
+cd web && npm install && npm run build && cd ..
+mkdir -p data && echo "AUTOFREE_API_KEY=$(openssl rand -hex 16)" > data/.env
 ```
 
-`uv` 没装的话：`curl -LsSf https://astral.sh/uv/install.sh | sh`。
+`uv` 没装的话:`curl -LsSf https://astral.sh/uv/install.sh | sh`。
 
-### 方式 B：纯 pip
+### 方式 D：纯 pip
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
-playwright install chromium
+playwright install chromium                           # ⚠️ 必跑
+playwright install-deps chromium 2>/dev/null || true  # 可能要 sudo
 ```
 
-### 验证
+### 验证安装
 
 ```bash
 uv run autofree status
 # 应该看到 "[settings]" "[admin]" "[auths] total: 0" "[runs] (latest 10)"
+
+# 验 chromium 装好了:
+uv run playwright install chromium --dry-run
+# 输出 "is already installed" 才算 OK
 ```
 
 ---
@@ -148,6 +187,8 @@ AutoFree 支持三种后端，**任选其一**，对接复杂度差不多。
 
 ## 6. 启动 AutoFree + 在 Web 配齐
 
+> **如果你跑了 setup.sh 或 docker compose**, 6.1 + 6.2 已经做完,直接跳到 6.3。
+
 ### 6.1 写 .env（只需 API Key）
 
 ```bash
@@ -173,12 +214,22 @@ cd ..
 
 ### 6.3 启动后端
 
+裸跑:
 ```bash
 uv run autofree api
 # 听到: "AutoFree API listening on http://0.0.0.0:8788"
 ```
 
-或后台跑：`nohup uv run autofree api > data/logs/api.log 2>&1 &`
+后台:
+```bash
+nohup uv run autofree api > data/logs/api.log 2>&1 &
+```
+
+Docker:
+```bash
+docker compose up -d
+docker compose logs -f autofree
+```
 
 ### 6.4 浏览器打开 + 填配置
 

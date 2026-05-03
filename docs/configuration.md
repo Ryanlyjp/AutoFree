@@ -222,6 +222,60 @@ location / {
 
 记得 nginx 不要加默认 timeout,任务可能跑很久。
 
+### Docker 部署
+
+```bash
+docker compose up -d --build
+docker compose logs -f autofree
+```
+
+容器把 `./data` 挂进 `/app/data`,所有运行时数据(.env / settings.json / admin_state.json / auths/ / runs/) 都在宿主机可见。
+
+**镜像里都有什么**:
+
+| 内容 | 由谁装 |
+|---|---|
+| Python 3.12 + uv | base image + curl install |
+| autofree 包 + 依赖 (FastAPI / Playwright / requests) | `uv sync` |
+| Chromium (~/.cache/ms-playwright/) | `uv run playwright install chromium` ← **不会复用宿主机的!** |
+| Chromium 系统 .so | `uv run playwright install-deps chromium` |
+| Node.js + npm | apt-get install |
+| 前端 build 产物 (web/dist/) | `npm install && npm run build` |
+| xvfb (虚拟 X server) | apt-get install,entrypoint 启动时跑 `Xvfb :99` |
+
+容器启动时 `docker-entrypoint.sh` 会自检 5 个关键 module 能否 import,失败就 crash-loop —— 你 `docker compose logs` 能看到原因。
+
+**重 build 时机**:
+- 改了 src/ Python 代码 → 重 build (COPY src 在 sync 之后)
+- 改了 web/ 前端 → 重 build
+- 改了 pyproject.toml → 重 build
+- 只改 settings.json / .env → **不用** 重 build,docker compose restart 即可
+
+```bash
+# 改完代码后
+docker compose down
+docker compose build
+docker compose up -d
+```
+
+**生产建议**:
+- shm_size 留 1g 不要改(Chromium 需要)
+- 重启策略 `unless-stopped`,母号 token 30 天过期前主动刷新
+- 不要把 `data/` chmod 全开,里面有 session_token + access_token
+
+### 直接修 settings.json
+
+不开 web 也能改:
+
+```bash
+# 编辑
+vim data/settings.json
+# 让正在运行的任务读到新值? 不会 —— 任务读的是 *启动那一刻* 的快照。
+# 下一次 POST /api/runs 时才生效。
+```
+
+settings.json 解析失败时会 rename 成 `.json.bak` 自动重建,不会丢一切。
+
 ### 多实例隔离
 
 把环境变量改一下让 `data/` 路径分开:
