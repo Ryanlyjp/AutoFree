@@ -112,9 +112,11 @@ async function probeCpa() {
 // ---- master ----
 
 const masterState = ref(null);
-const tokenForm = reactive({ session_token: "", account_id: "", email: "" });
+const tokenForm = reactive({ session_token: "", access_token: "", account_id: "", email: "" });
 const accountIdForm = reactive({ account_id: "" });
+const accessTokenForm = reactive({ access_token: "" });
 const masterProbe = ref(null);
+const masterDiag = ref(null);
 
 async function refreshMaster() {
   try {
@@ -133,12 +135,14 @@ async function importToken() {
   }
   try {
     const payload = { session_token: tokenForm.session_token };
+    if (tokenForm.access_token) payload.access_token = tokenForm.access_token;
     if (tokenForm.account_id) payload.account_id = tokenForm.account_id;
     if (tokenForm.email) payload.email = tokenForm.email;
-    await api.masterImportToken(payload);
+    const res = await api.masterImportToken(payload);
     tokenForm.session_token = "";
-    success.value = "session_token 已导入";
-    setTimeout(() => (success.value = ""), 2500);
+    tokenForm.access_token = "";
+    success.value = `session_token 已导入 (access_token: ${res.access_token_source || '?'})`;
+    setTimeout(() => (success.value = ""), 3500);
     await refreshMaster();
     emit("master-changed");
   } catch (e) {
@@ -155,6 +159,29 @@ async function setAccountId() {
     emit("master-changed");
   } catch (e) {
     error.value = e.message;
+  }
+}
+
+async function setAccessTokenOnly() {
+  error.value = "";
+  try {
+    await api.masterSetAccessToken(accessTokenForm.access_token);
+    accessTokenForm.access_token = "";
+    success.value = "access_token 已更新";
+    setTimeout(() => (success.value = ""), 2500);
+    await refreshMaster();
+    emit("master-changed");
+  } catch (e) {
+    error.value = e.message;
+  }
+}
+
+async function runDiagnose() {
+  masterDiag.value = { running: true };
+  try {
+    masterDiag.value = await api.masterDiagnose();
+  } catch (e) {
+    masterDiag.value = { error: e.message };
   }
 }
 
@@ -289,22 +316,46 @@ onMounted(async () => {
       </header>
 
       <details class="text-xs text-slate-600">
-        <summary class="cursor-pointer">如何取 session_token?</summary>
+        <summary class="cursor-pointer">如何取 session_token + access_token?</summary>
         <ol class="mt-1 ml-4 list-decimal space-y-1">
-          <li>浏览器登录母号 ChatGPT,DevTools → Application → Cookies → chatgpt.com</li>
-          <li>找 <code>__Secure-next-auth.session-token</code>(或 .0/.1 两段),复制 value</li>
-          <li>account_id 在 ChatGPT URL <code>/admin/...</code> 或 <code>/api/auth/session</code> 响应里</li>
+          <li>浏览器登录母号 ChatGPT,F12 打开 DevTools</li>
+          <li><strong>session_token</strong>: Application → Cookies → chatgpt.com →
+            找 <code>__Secure-next-auth.session-token</code>(可能被切成 <code>.0</code> + <code>.1</code> 两段,
+            <strong>按数字顺序拼接</strong>),复制完整 value 粘到下面 session_token 框</li>
+          <li><strong>access_token</strong>(强烈推荐): Network → 刷新页面 → 找
+            <code>/api/auth/session</code> 请求 → Response → 复制 <code>accessToken</code> 字段的值
+            (<code>eyJ...</code> 开头),粘到 access_token 框</li>
+          <li><strong>account_id</strong>: <code>/api/auth/session</code> 同一响应里的
+            <code>user.default_workspace_id</code>; 或 Network 任何 admin 页面请求头
+            <code>chatgpt-account-id</code> 的值 (UUID)</li>
         </ol>
+        <p class="mt-1 text-amber-700">如果不填 access_token, 程序会用 session_token 去
+            <code>/api/auth/session</code> 自己换;若 chatgpt 返回空 session(出现 "Access token is missing" 401)
+            就需要补填 access_token。</p>
       </details>
 
       <div class="grid grid-cols-3 gap-3">
         <div class="col-span-3">
-          <label class="label">session_token</label>
-          <textarea v-model="tokenForm.session_token" class="textarea" rows="3" placeholder="__Secure-next-auth.session-token 的 value"></textarea>
+          <label class="label">session_token <span class="text-rose-500">*</span></label>
+          <textarea v-model="tokenForm.session_token" class="textarea" rows="3" placeholder="__Secure-next-auth.session-token 的 value (chunked 时按 .0+.1 顺序拼接)"></textarea>
+        </div>
+        <div class="col-span-3">
+          <label class="label">access_token (推荐)</label>
+          <textarea v-model="tokenForm.access_token" class="textarea" rows="2" placeholder="从 /api/auth/session 响应里复制的 accessToken (eyJ... 开头)"></textarea>
         </div>
         <div><label class="label">account_id (可选)</label><input v-model="tokenForm.account_id" class="input" /></div>
         <div><label class="label">email (可选)</label><input v-model="tokenForm.email" class="input" /></div>
         <div class="self-end"><button class="btn-primary w-full" @click="importToken">导入并验证</button></div>
+      </div>
+
+      <div class="grid grid-cols-3 gap-3 border-t pt-3">
+        <div class="col-span-2">
+          <label class="label">单独更新 access_token</label>
+          <input v-model="accessTokenForm.access_token" class="input" type="password" placeholder="用于已导入 session_token 但 401 时补 Bearer (留空 = 清除)" />
+        </div>
+        <div class="self-end">
+          <button class="btn-primary w-full" @click="setAccessTokenOnly">更新 access_token</button>
+        </div>
       </div>
 
       <div class="grid grid-cols-3 gap-3 border-t pt-3">
@@ -318,8 +369,30 @@ onMounted(async () => {
         </div>
       </div>
 
-      <div class="flex items-center gap-3 border-t pt-3">
-        <button class="btn-secondary" @click="probeMaster">probe identity + members</button>
+      <div class="border-t pt-3 space-y-2">
+        <div class="flex items-center gap-3">
+          <button class="btn-secondary" @click="runDiagnose">诊断 (检查 session + backend)</button>
+          <button class="btn-secondary" @click="probeMaster">probe identity + members</button>
+        </div>
+        <div v-if="masterDiag" class="text-xs bg-slate-50 rounded p-2 space-y-1 font-mono">
+          <div v-if="masterDiag.running">running...</div>
+          <template v-else>
+            <div>session_token_set: <span :class="masterDiag.session_token_set ? 'text-emerald-600' : 'text-rose-600'">{{ masterDiag.session_token_set }}</span></div>
+            <div>access_token_set: <span :class="masterDiag.access_token_set ? 'text-emerald-600' : 'text-amber-600'">{{ masterDiag.access_token_set }}</span></div>
+            <div>account_id_set: <span :class="masterDiag.account_id_set ? 'text-emerald-600' : 'text-amber-600'">{{ masterDiag.account_id_set }}</span></div>
+            <div v-if="masterDiag.session">
+              /api/auth/session: <span :class="masterDiag.session.ok ? 'text-emerald-600' : 'text-rose-600'">{{ masterDiag.session.status || '-' }}</span>
+              has_user={{ masterDiag.session.has_user }} has_access_token={{ masterDiag.session.has_access_token }}
+              <div v-if="masterDiag.session.preview" class="text-rose-600 break-all">preview: {{ masterDiag.session.preview }}</div>
+              <div v-if="masterDiag.session.error" class="text-rose-600">error: {{ masterDiag.session.error }}</div>
+            </div>
+            <div v-if="masterDiag.backend_settings">
+              /backend-api/.../settings: <span :class="masterDiag.backend_settings.ok ? 'text-emerald-600' : 'text-rose-600'">{{ masterDiag.backend_settings.status || '-' }}</span>
+              <div v-if="masterDiag.backend_settings.preview" class="text-rose-600 break-all">preview: {{ masterDiag.backend_settings.preview }}</div>
+              <div v-if="masterDiag.backend_settings.error" class="text-rose-600">error: {{ masterDiag.backend_settings.error }}</div>
+            </div>
+          </template>
+        </div>
         <span v-if="masterProbe?.running" class="text-xs text-slate-500">probing...</span>
         <template v-else-if="masterProbe?.ok">
           <span class="tag-ok">auto_provision: {{ masterProbe.auto_provision }}</span>

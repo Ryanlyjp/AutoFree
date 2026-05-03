@@ -124,11 +124,14 @@ AutoFree 支持三种后端，**任选其一**，对接复杂度差不多。
 
 ### 4.3 拿到母号关键信息
 
-后面要导入 AutoFree，**记一下**：
+后面要导入 AutoFree，**记下这四个**（后两个可选但**强烈推荐**填）：
 
 - **母号邮箱**
-- **session_token** ← 浏览器 DevTools → Application → Cookies → `https://chatgpt.com` → 找 `__Secure-next-auth.session-token`，复制 value（很长，可能分 `.0` `.1` 两段，复制时按字母顺序拼起来）
-- **account_id** ← URL 里 `chatgpt.com/admin/...` 那一段不显式有，但 `chatgpt.com/api/auth/session` 响应里有；或者打开 DevTools Network 面板，随便点一下 admin 页面，看请求头 `chatgpt-account-id` 的值（一个 UUID）
+- **session_token** ← 浏览器 DevTools → Application → Cookies → `https://chatgpt.com` → 找 `__Secure-next-auth.session-token`,复制 value（很长，可能分 `.0` `.1` 两段，**按数字顺序顺序拼起来,不要漏字符**）
+- **access_token** ← 浏览器 DevTools → Network → 刷新页面 → 找 `/api/auth/session` 这条请求 → Response 里复制 `accessToken` 字段的 value（`eyJ...` 开头）
+- **account_id** ← `/api/auth/session` 响应里 `user.default_workspace_id` 字段；或 Network 任何 admin 请求头 `chatgpt-account-id` 的值（UUID）
+
+> 为什么要 access_token？chatgpt 的 `/backend-api/*` 端点要求 Bearer，光 session cookie 会得到 `401 Access token is missing`。AutoFree 默认用 cookie 自动换 access_token，但 chatgpt NextAuth 的某些版本不给 — 直接粘 access_token 是最稳的做法。
 
 ---
 

@@ -64,6 +64,39 @@ Connection refused
 
 session_token 复制时漏了一段。`__Secure-next-auth.session-token` 在 cookie 表里可能被拆成 `.0` `.1` 两段，按数字顺序拼起来再粘。粘完总长一般 6000-8000 字符。
 
+### 母号导入后操作：`Unauthorized - Access token is missing` (HTTP 401)
+
+完整报文长这样：
+
+```
+GET /backend-api/accounts/<uuid>/settings: HTTP 401
+{"detail":{"message":"Unauthorized - Access token is missing"}}
+```
+
+**根因**：chatgpt 的 `/backend-api/*` 端点 **要求 Bearer access_token**，光有 session cookie 不够。AutoFree 默认会用 session cookie 去 `/api/auth/session` 自动换 access_token；但有些情况下（cookie 拼接错位、Cloudflare 干扰、chatgpt 后端 NextAuth 版本问题）这一步换不出来，于是 backend-api 调用就 401。
+
+**修复**：手动从浏览器把 access_token 也粘进来。两步：
+
+1. 浏览器 F12 → **Network** → 刷新当前 chatgpt 页 → 找 `/api/auth/session` 那条请求
+2. 切到 **Response** 面板 → 复制 `accessToken` 字段的 value（很长，`eyJ...` 开头）
+3. 在 AutoFree Setup 页：
+   - **首次导入** 同时填 session_token + access_token,点 **导入并验证**
+   - **已导入但报 401** 用 **单独更新 access_token** 那一栏粘贴,点 **更新 access_token**
+
+之后所有 `/backend-api/*` 调用都会带这个 Bearer 头，401 消失。
+
+**诊断**：Setup 页的 **诊断** 按钮（或 `GET /api/master/diagnose`）会打印：
+
+```
+session_token_set: true
+access_token_set: false        ← 这里 false 就是问题
+account_id_set: true
+/api/auth/session: 200 has_user=false has_access_token=false  ← 空 session,cookie 不被认
+/backend-api/.../settings: 401 preview: '...Access token is missing...'
+```
+
+**注意**：access_token 是个 JWT，**有效期一般 30 天**（看 payload 的 `exp`），过期后再补一次新值即可。
+
 ### 母号导入：`MasterCloudflareError`
 
 Cloudflare 把直连 chatgpt 的请求拦截了。两种可能：

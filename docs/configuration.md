@@ -113,9 +113,13 @@ session_token 是关键凭据，三种来源：
 
 ### A. 浏览器手抄（最快）
 
+需要 **两段** 数据：session_token (来自 cookie) + access_token (来自 JSON 响应)。
+
+#### A.1 session_token
+
 1. 母号已登录的浏览器 → DevTools (F12) → Application → Storage → Cookies → `https://chatgpt.com`
 2. 找到 `__Secure-next-auth.session-token`
-3. 直接复制 value 列。**注意**：cookie 太长会被自动拆成 `__Secure-next-auth.session-token.0` 和 `.1`，按 `.0`+`.1` 顺序拼起来。
+3. 直接复制 value 列。**注意**：cookie 太长会被自动拆成 `.0` 和 `.1` 两行，**按数字顺序拼起来，不要漏字符**：
 
 ```
 [  浏览器 cookie 表  ]
@@ -126,7 +130,25 @@ session_token 是关键凭据，三种来源：
 session_token = "eyJhbGciOi...AAABBB...zzzZZZ"   # 顺序拼接
 ```
 
-把它粘贴到 Setup 页的 **session_token** 文本框里。AutoFree 内部会判断长度 > 3800 自动拆 `.0/.1` 发回去。
+#### A.2 access_token （**强烈推荐**）
+
+chatgpt 的 `/backend-api/*` 端点必须带 Bearer access_token。AutoFree 会试着用 session cookie 自动换；但有时换不出来（NextAuth 版本差异、Cloudflare），就报 `401 Access token is missing`。直接粘 access_token 一劳永逸：
+
+1. DevTools → **Network** 面板
+2. 刷新当前 chatgpt 页面（Ctrl+R）
+3. 在 Network 列表里找 **`session`** 这条请求（路径是 `/api/auth/session`）
+4. 点开 → **Response** 标签 → 复制 `accessToken` 字段的整个 value（`eyJ...` 开头，~1500 字符）
+
+#### A.3 粘贴
+
+打开 AutoFree Web → Setup 页 → 母号区：
+
+- **session_token** 框：粘 A.1 的拼接值
+- **access_token** 框：粘 A.2 的值
+- **account_id** 框：粘 `default_workspace_id` 或任意 admin 请求头里 `chatgpt-account-id` 的 UUID
+- 点 **导入并验证**
+
+如果以后 access_token 过期（一般 30 天），用 **单独更新 access_token** 那一栏补一次新值即可，不用重导 session_token。
 
 ### B. CLI
 
@@ -136,6 +158,16 @@ uv run autofree import-token
 ```
 
 stdin 模式不显示输入。
+
+> CLI 当前版本不支持 access_token；如要补 access_token,直接调 API:
+>
+> ```bash
+> KEY=$(grep ^AUTOFREE_API_KEY data/.env | cut -d= -f2)
+> curl -X POST -H "Authorization: Bearer $KEY" \
+>      -H "Content-Type: application/json" \
+>      -d '{"access_token":"eyJ..."}' \
+>      http://localhost:8788/api/master/set-access-token
+> ```
 
 ### C. Playwright 邮箱密码登录（实验）
 

@@ -121,15 +121,57 @@ curl -X POST -H "Authorization: Bearer $KEY" \
      -H "Content-Type: application/json" \
      -d '{
        "session_token": "eyJhb...全文",
-       "account_id": "abc-...",   "email": "master@example.com"
+       "access_token":  "eyJhb...来自 /api/auth/session 响应的 accessToken (推荐)",
+       "account_id":    "abc-...",
+       "email":         "master@example.com"
      }' http://localhost:8788/api/master/import-token
 ```
 
 `account_id` / `email` 可省 — 服务端会从 `/api/auth/session` 推断。
 
+`access_token` **强烈推荐填**：chatgpt 的 `/backend-api/*` 端点必须带 Bearer。不填则程序会试着用 session cookie 自动换；换不出来就会报 "Access token is missing" 401。详见 [troubleshooting.md](troubleshooting.md#母号导入后操作unauthorized---access-token-is-missing-http-401)。
+
+返回字段 `access_token_source` 会标 `user-provided` 或 `from-session`。
+
 ### `POST /api/master/set-account-id`
 
 session_token 已导入但 account_id 错的情况下用。
+
+### `POST /api/master/set-access-token`
+
+单独更新 / 清除 access_token,不动 session_token：
+
+```bash
+curl -X POST -H "Authorization: Bearer $KEY" \
+     -H "Content-Type: application/json" \
+     -d '{"access_token":"eyJ..."}' \
+     http://localhost:8788/api/master/set-access-token
+# 清除:
+curl -X POST -H "Authorization: Bearer $KEY" \
+     -H "Content-Type: application/json" \
+     -d '{"access_token":""}' \
+     http://localhost:8788/api/master/set-access-token
+```
+
+### `GET /api/master/diagnose`
+
+非破坏性自检,打印 session + backend-api 各自的状态。看不懂日志时先调这个：
+
+```json
+{
+  "session_token_set": true,
+  "access_token_set": false,
+  "account_id_set": true,
+  "session": {
+    "ok": true, "status": 200,
+    "has_user": false, "has_access_token": false
+  },
+  "backend_settings": {
+    "ok": false, "status": 401,
+    "preview": "{\"detail\":{\"message\":\"Unauthorized - Access token is missing\"}}"
+  }
+}
+```
 
 ### `DELETE /api/master/state`
 

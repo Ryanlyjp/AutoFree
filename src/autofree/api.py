@@ -163,10 +163,15 @@ class ImportTokenReq(BaseModel):
     session_token: str = Field(..., min_length=10)
     account_id: str | None = None
     email: str | None = None
+    access_token: str | None = None  # optional Bearer override
 
 
 class SetAccountReq(BaseModel):
     account_id: str = Field(..., min_length=1)
+
+
+class SetAccessTokenReq(BaseModel):
+    access_token: str  # empty string clears it
 
 
 class AutoProvisionReq(BaseModel):
@@ -188,7 +193,12 @@ def master_state() -> dict[str, Any]:
 @app.post("/api/master/import-token", dependencies=[Depends(require_api_key)])
 def master_import_token(req: ImportTokenReq) -> dict[str, Any]:
     try:
-        return master.import_session_token(req.session_token, account_id=req.account_id, email=req.email)
+        return master.import_session_token(
+            req.session_token,
+            account_id=req.account_id,
+            email=req.email,
+            access_token=req.access_token,
+        )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -199,6 +209,19 @@ def master_set_account_id(req: SetAccountReq) -> dict[str, Any]:
         return master.set_account_id(req.account_id)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/master/set-access-token", dependencies=[Depends(require_api_key)])
+def master_set_access_token(req: SetAccessTokenReq) -> dict[str, Any]:
+    try:
+        return master.set_access_token(req.access_token)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/master/diagnose", dependencies=[Depends(require_api_key)])
+def master_diagnose() -> dict[str, Any]:
+    return master.diagnose()
 
 
 @app.delete("/api/master/state", dependencies=[Depends(require_api_key)])

@@ -74,14 +74,17 @@ def get_workspace_name() -> str:
 
 
 def get_summary() -> dict[str, Any]:
-    """Public summary safe to send to the web UI (no token)."""
+    """Public summary safe to send to the web UI (no raw tokens)."""
     s = get_state()
     token = s.get("session_token") or ""
+    at = s.get("access_token") or ""
     return {
         "email": s.get("email") or "",
         "account_id": s.get("account_id") or "",
         "workspace_name": s.get("workspace_name") or "",
         "has_session_token": bool(token),
         "session_token_len": len(token),
+        "has_access_token": bool(at),
+        "access_token_len": len(at),
         "updated_at": s.get("updated_at") or "",
     }

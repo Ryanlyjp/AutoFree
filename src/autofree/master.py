@@ -60,10 +60,18 @@ class MasterClient:
         *,
         device_id: str | None = None,
         proxy: str | None = None,
+        access_token: str | None = None,
     ):
         self.session_token = session_token or admin_state.get_session_token()
         self.account_id = account_id or admin_state.get_account_id()
         self.device_id = device_id or str(uuid.uuid4())
+        # Pre-seeded access_token wins over /api/auth/session-derived one.
+        # Saved value lives in admin_state (`access_token` field). User may paste
+        # it on the Setup page when /api/auth/session can't be made to work
+        # (e.g. cookie too restrictive, Cloudflare interference).
+        self._user_access_token: str | None = (
+            access_token or admin_state.get_state().get("access_token") or None
+        )
         self._access_token: str | None = None
         self._access_token_fetched_at: float = 0.0
 
@@ -75,19 +83,15 @@ class MasterClient:
     # ------------------------------------------------------------ headers / cookies
 
     def _cookie_jar(self) -> dict[str, str]:
-        # Long session_tokens are split across __Secure-next-auth.session-token.0/.1
-        # by the chatgpt.com login page. We accept either: a raw concatenated value
-        # we save as `session-token`, or the user already pasted segmented values.
+        # Send the raw session_token under one cookie name only. Don't try to
+        # auto-split into .0/.1 — getting the wrong split point yields a cookie
+        # NextAuth refuses to decrypt and the response becomes a logged-out
+        # session (200 with empty body). If your token comes from chunked
+        # cookies, paste the *concatenated* value (.0 + .1) into session_token.
         token = self.session_token or ""
         if not token:
             return {}
-        jar = {SESSION_COOKIE_NAME: token}
-        # If the token is very long, also expose segmented form (some endpoints check it).
-        if len(token) > 3800:
-            mid = len(token) // 2
-            jar[f"{SESSION_COOKIE_NAME}.0"] = token[:mid]
-            jar[f"{SESSION_COOKIE_NAME}.1"] = token[mid:]
-        return jar
+        return {SESSION_COOKIE_NAME: token}
 
     def _base_headers(self, *, referer: str | None = None) -> dict[str, str]:
         h = {
@@ -146,15 +150,32 @@ class MasterClient:
     # ------------------------------------------------------------ access token
 
     def _get_access_token(self, *, silent: bool = False) -> str | None:
-        # Cache for 10 min — token JWT is valid much longer but session can
-        # still rotate so we refresh periodically.
+        """Resolve a Bearer access_token for /backend-api/* calls.
+
+        Priority:
+          1. User-pasted access_token (admin_state.access_token) — never expires
+             from our point of view; we just trust it until chatgpt rejects.
+          2. Cached JWT from a recent /api/auth/session call (10-min TTL).
+          3. Fresh /api/auth/session fetch — only works when chatgpt accepts
+             our session cookie.
+
+        When step 3 fails or returns an empty/logged-out session, returns None
+        unless `silent=False`, in which case it logs a warning. The caller is
+        expected to surface a clearer error to the user.
+        """
+        if self._user_access_token:
+            return self._user_access_token
         if self._access_token and time.time() - self._access_token_fetched_at < 600:
             return self._access_token
         try:
             r = self.session.get(
                 f"{CHATGPT_BASE}/api/auth/session",
                 cookies=self._cookie_jar(),
-                headers={"user-agent": DEFAULT_USER_AGENT, "accept": "application/json"},
+                headers={
+                    "user-agent": DEFAULT_USER_AGENT,
+                    "accept": "application/json",
+                    "referer": f"{CHATGPT_BASE}/",
+                },
                 timeout=15,
             )
         except Exception as exc:
@@ -163,7 +184,7 @@ class MasterClient:
             return None
         if r.status_code != 200:
             if not silent:
-                logger.warning("[master] /api/auth/session HTTP %d", r.status_code)
+                logger.warning("[master] /api/auth/session HTTP %d body=%s", r.status_code, (r.text or "")[:200])
             return None
         try:
             data = r.json() or {}
@@ -178,19 +199,33 @@ class MasterClient:
     # ------------------------------------------------------------ public ops
 
     def verify_session(self) -> dict[str, Any]:
-        """Probe /api/auth/session + /backend-api/me to confirm the cookie works.
-        Returns a dict with email, account_id, workspace_name when known.
+        """Probe /api/auth/session + /backend-api/accounts/{id}/settings to
+        confirm credentials. Returns dict {email, account_id, workspace_name}.
+
+        If the session cookie alone can't produce a logged-in session AND the
+        user did not provide a separate access_token, raises a clear error
+        explaining the two recovery paths.
         """
         # /api/auth/session works without an account_id and gives us email.
         r = self.session.get(
             f"{CHATGPT_BASE}/api/auth/session",
             cookies=self._cookie_jar(),
-            headers={"user-agent": DEFAULT_USER_AGENT, "accept": "application/json"},
+            headers={
+                "user-agent": DEFAULT_USER_AGENT,
+                "accept": "application/json",
+                "referer": f"{CHATGPT_BASE}/",
+            },
             timeout=15,
         )
         if r.status_code != 200:
-            raise MasterAuthError(f"/api/auth/session HTTP {r.status_code}")
-        sess = r.json() or {}
+            raise MasterAuthError(
+                f"/api/auth/session HTTP {r.status_code} — chatgpt 拒绝了 session_token cookie。"
+                " 重新从浏览器复制完整 session_token (chunked 形式记得拼接 .0 + .1)。"
+            )
+        try:
+            sess = r.json() or {}
+        except Exception:
+            sess = {}
         user = (sess.get("user") or {})
         email = user.get("email") or ""
         token = sess.get("accessToken") or sess.get("access_token")
@@ -198,11 +233,33 @@ class MasterClient:
             self._access_token = token
             self._access_token_fetched_at = time.time()
 
-        # If we know the account_id, also fetch /accounts to confirm membership and pick up workspace_name.
+        # /api/auth/session returned a logged-out shell? Cookie isn't being
+        # accepted by NextAuth. Two valid paths forward — surface both.
+        if not email and not token and not self._user_access_token:
+            preview = (r.text or "")[:200]
+            raise MasterAuthError(
+                "/api/auth/session 返回了空 session(cookie 无效或被截断)。两种修法,任选一种:\n"
+                "  ① 从浏览器 DevTools 复制完整 __Secure-next-auth.session-token "
+                "(分 .0 / .1 段时按顺序拼接,不要漏字符), 重新导入。\n"
+                "  ② 同时粘贴 access_token: DevTools → Network → 任意一次 "
+                "/api/auth/session 请求 → Response 里复制 accessToken 的值,"
+                "在 Setup 页 access_token 框粘贴。\n"
+                f"原始响应片段: {preview!r}"
+            )
+
+        # If we know the account_id, also fetch /settings to confirm membership and pick up workspace_name.
         info: dict[str, Any] = {"email": email}
         if self.account_id:
-            r2 = self._request("GET", f"/backend-api/accounts/{self.account_id}/settings",
-                               referer=f"{CHATGPT_BASE}/admin")
+            try:
+                r2 = self._request("GET", f"/backend-api/accounts/{self.account_id}/settings",
+                                   referer=f"{CHATGPT_BASE}/admin")
+            except MasterAuthError as exc:
+                # 401/403 here is almost certainly "Access token is missing" —
+                # rethrow with actionable hint.
+                raise MasterAuthError(
+                    f"{exc}。已拿到 session 但 access_token 缺失或被拒。"
+                    " 请在 Setup 页 access_token 框粘贴 (从浏览器 /api/auth/session 响应里复制)。"
+                )
             if r2.status_code == 200:
                 try:
                     body = r2.json() or {}
@@ -335,34 +392,72 @@ def import_session_token(
     *,
     account_id: str | None = None,
     email: str | None = None,
+    access_token: str | None = None,
 ) -> dict[str, Any]:
-    """Verify a pasted session_token, then persist it to data/admin_state.json.
+    """Verify a pasted session_token (+ optional access_token), persist to admin_state.
 
-    `account_id` is optional — if omitted, this function tries to infer it
-    from /api/auth/session's user payload (when ChatGPT exposes it). If still
-    unknown, the caller must set it explicitly via set_account_id later.
+    Pass `access_token` when chatgpt's `/api/auth/session` won't yield one (the
+    most common reason for the "Access token is missing" 401). Copy it from
+    DevTools → Network → /api/auth/session response → `accessToken` field.
     """
     token = (session_token or "").strip()
     if not token:
         raise ValueError("session_token 为空")
+    at = (access_token or "").strip() or None
 
-    client = MasterClient(session_token=token, account_id=account_id)
+    client = MasterClient(session_token=token, account_id=account_id, access_token=at)
     info = client.verify_session()
     final_email = (email or info.get("email") or "").strip().lower()
     final_account = account_id or info.get("account_id") or ""
     state = admin_state.update_state(
         session_token=token,
+        access_token=at,  # None → admin_state.update_state will pop the field
         account_id=final_account or None,
         email=final_email or None,
         workspace_name=info.get("workspace_name") or None,
         updated_at=_now_iso(),
     )
-    logger.info("[master] session_token 已导入 email=%s account_id=%s", final_email, final_account)
+    logger.info("[master] session_token 已导入 email=%s account_id=%s access_token=%s",
+                final_email, final_account, "set" if at else "from-session")
     return {
         "ok": True,
         "email": final_email,
         "account_id": final_account,
         "workspace_name": state.get("workspace_name") or "",
+        "access_token_source": "user-provided" if at else "from-session",
+    }
+
+
+def set_access_token(access_token: str) -> dict[str, Any]:
+    """Add/replace the master access_token without touching session_token.
+
+    Useful when /api/auth/session refuses our cookie but the user can still
+    grab a Bearer token from a working browser tab.
+    """
+    at = (access_token or "").strip()
+    if not at:
+        # Empty value clears it.
+        admin_state.update_state(access_token=None, updated_at=_now_iso())
+        return {"ok": True, "cleared": True}
+    token = admin_state.get_session_token()
+    aid = admin_state.get_account_id()
+    if not token:
+        # Allow access_token-only mode. session_token strictly speaking is no
+        # longer needed for /backend-api/* once we have Bearer; we still keep
+        # session_token in the model for /api/auth/session and consent flows.
+        admin_state.update_state(access_token=at, updated_at=_now_iso())
+        return {"ok": True, "warning": "session_token 未设置,只有 access_token 可能不够"}
+    client = MasterClient(session_token=token, account_id=aid, access_token=at)
+    info = client.verify_session()
+    admin_state.update_state(
+        access_token=at,
+        workspace_name=info.get("workspace_name") or None,
+        updated_at=_now_iso(),
+    )
+    return {
+        "ok": True,
+        "account_id": aid,
+        "workspace_name": info.get("workspace_name") or "",
     }
 
 
@@ -374,7 +469,8 @@ def set_account_id(account_id: str) -> dict[str, Any]:
     token = admin_state.get_session_token()
     if not token:
         raise MasterAuthError("session_token 未导入,请先 import_session_token")
-    client = MasterClient(session_token=token, account_id=aid)
+    saved_at = admin_state.get_state().get("access_token") or None
+    client = MasterClient(session_token=token, account_id=aid, access_token=saved_at)
     info = client.verify_session()
     state = admin_state.update_state(
         account_id=aid,
@@ -395,4 +491,62 @@ def get_default_client() -> MasterClient:
     if not token:
         raise MasterAuthError("session_token 未导入")
     aid = admin_state.get_account_id()
-    return MasterClient(session_token=token, account_id=aid)
+    saved_at = admin_state.get_state().get("access_token") or None
+    return MasterClient(session_token=token, account_id=aid, access_token=saved_at)
+
+
+def diagnose() -> dict[str, Any]:
+    """Run a non-throwing self-test against /api/auth/session + (if account_id
+    set) /backend-api/accounts/{id}/settings. Returns a dict the UI can render."""
+    token = admin_state.get_session_token()
+    aid = admin_state.get_account_id()
+    saved_at = admin_state.get_state().get("access_token") or None
+    out: dict[str, Any] = {
+        "session_token_set": bool(token),
+        "access_token_set": bool(saved_at),
+        "account_id_set": bool(aid),
+    }
+    if not token:
+        out["session"] = {"ok": False, "error": "session_token 未导入"}
+        return out
+    client = MasterClient(session_token=token, account_id=aid, access_token=saved_at)
+    # session probe
+    try:
+        r = client.session.get(
+            f"{CHATGPT_BASE}/api/auth/session",
+            cookies=client._cookie_jar(),
+            headers={"user-agent": DEFAULT_USER_AGENT, "accept": "application/json",
+                     "referer": f"{CHATGPT_BASE}/"},
+            timeout=15,
+        )
+        body = {}
+        try:
+            body = r.json() or {}
+        except Exception:
+            body = {}
+        out["session"] = {
+            "ok": r.status_code == 200,
+            "status": r.status_code,
+            "has_user": bool((body.get("user") or {}).get("email")),
+            "has_access_token": bool(body.get("accessToken") or body.get("access_token")),
+            "preview": (r.text or "")[:200] if r.status_code != 200 else None,
+        }
+    except Exception as exc:
+        out["session"] = {"ok": False, "error": str(exc)}
+    # backend-api settings probe (only if account_id set)
+    if aid:
+        try:
+            r2 = client.session.get(
+                f"{CHATGPT_BASE}/backend-api/accounts/{aid}/settings",
+                cookies=client._cookie_jar(),
+                headers=client._base_headers(),
+                timeout=15,
+            )
+            out["backend_settings"] = {
+                "ok": r2.status_code == 200,
+                "status": r2.status_code,
+                "preview": (r2.text or "")[:200] if r2.status_code != 200 else None,
+            }
+        except Exception as exc:
+            out["backend_settings"] = {"ok": False, "error": str(exc)}
+    return out
