@@ -58,6 +58,7 @@ export const api = {
   runsStart: (payload) => request("POST", "/api/runs", payload),
   runsGet: (id) => request("GET", `/api/runs/${id}`),
   runsCancel: (id) => request("POST", `/api/runs/${id}/cancel`),
+  runsKickCohort: (id, emails) => request("POST", `/api/runs/${id}/kick-cohort`, { emails: emails ?? null }),
 
   authsList: () => request("GET", "/api/auths"),
   authsGet: (email) => request("GET", `/api/auths/${encodeURIComponent(email)}`),

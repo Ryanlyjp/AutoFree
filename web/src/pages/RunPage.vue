@@ -86,6 +86,44 @@ async function cancel(id) {
   }
 }
 
+// ---- kick cohort ----
+const kicking = ref(false);
+const kickingEmail = ref("");  // email being kicked individually
+const kickResult = ref(null);
+
+async function kickAll(id) {
+  if (!confirm(`把 run ${id} 里所有未踢账号都踢出 Team?`)) return;
+  kicking.value = true;
+  kickResult.value = null;
+  try {
+    const res = await api.runsKickCohort(id, null);
+    kickResult.value = res;
+    await inspect(id);
+  } catch (e) {
+    error.value = e.message;
+  } finally {
+    kicking.value = false;
+  }
+}
+
+async function kickOne(id, email) {
+  kickingEmail.value = email;
+  kickResult.value = null;
+  try {
+    const res = await api.runsKickCohort(id, [email]);
+    kickResult.value = res;
+    await inspect(id);
+  } catch (e) {
+    error.value = e.message;
+  } finally {
+    kickingEmail.value = "";
+  }
+}
+
+const hasUnkicked = computed(() =>
+  (focused.value?.cohort || []).some(m => !m.kicked)
+);
+
 function startPolling() {
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(async () => {
@@ -211,21 +249,38 @@ onBeforeUnmount(() => {
 
       <!-- focused detail -->
       <section class="card col-span-2 space-y-3">
-        <header class="flex items-center gap-3">
+        <header class="flex items-center gap-3 flex-wrap">
           <h3 class="text-sm font-semibold">详情</h3>
           <span v-if="focused" class="text-xs text-slate-500 font-mono">{{ focused.id }}</span>
           <span v-if="focused" class="tag-neutral">{{ focused.status }}</span>
-          <button
-            v-if="focused && ['running','pending'].includes(focused.status)"
-            class="btn-danger ml-auto text-xs px-2 py-1" @click="cancel(focused.id)"
-          >cancel</button>
+          <div class="ml-auto flex items-center gap-2">
+            <button
+              v-if="focused && ['running','pending'].includes(focused.status)"
+              class="btn-danger text-xs px-2 py-1" @click="cancel(focused.id)"
+            >cancel</button>
+            <button
+              v-if="focused && hasUnkicked && !['running','pending'].includes(focused.status)"
+              class="btn-primary text-xs px-2 py-1"
+              :disabled="kicking"
+              @click="kickAll(focused.id)"
+            >{{ kicking ? '踢出中…' : '踢出全部未踢' }}</button>
+          </div>
         </header>
+
+        <!-- kick result banner -->
+        <div v-if="kickResult" class="text-xs rounded px-3 py-2"
+          :class="kickResult.kicked === kickResult.total ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'">
+          踢出 {{ kickResult.kicked }}/{{ kickResult.total }}
+          <span v-for="r in kickResult.results" :key="r.email" class="ml-2">
+            {{ r.email.split('@')[0] }}:{{ r.ok ? '✓' : '✗' + r.reason }}
+          </span>
+        </div>
 
         <div v-if="!focused" class="text-xs text-slate-500">点左侧选一条任务查看进度</div>
 
         <template v-else>
           <!-- stepper -->
-          <div class="flex items-center gap-1 text-xs">
+          <div class="flex flex-wrap items-center gap-1 text-xs">
             <span
               v-for="(s, i) in stages"
               :key="s"
@@ -245,7 +300,7 @@ onBeforeUnmount(() => {
             </div>
             <div class="card p-3 bg-slate-50">
               <div class="text-slate-500">已踢出</div>
-              <div class="text-lg font-bold">{{ focused.summary?.kicked ?? 0 }}</div>
+              <div class="text-lg font-bold">{{ focused.summary?.kicked ?? (focused.cohort||[]).filter(m=>m.kicked).length }}</div>
             </div>
           </div>
 
@@ -260,6 +315,7 @@ onBeforeUnmount(() => {
                     <th class="text-left px-2 py-1">stage</th>
                     <th class="text-left px-2 py-1">kicked</th>
                     <th class="text-left px-2 py-1">error</th>
+                    <th class="text-left px-2 py-1"></th>
                   </tr>
                 </thead>
                 <tbody>
@@ -271,8 +327,16 @@ onBeforeUnmount(() => {
                     </td>
                     <td class="px-2 py-1">{{ m.kicked ? '✓' : '' }}</td>
                     <td class="px-2 py-1 text-rose-600 max-w-xs truncate" :title="m.error">{{ m.error }}</td>
+                    <td class="px-2 py-1">
+                      <button
+                        v-if="!m.kicked"
+                        class="text-indigo-600 hover:text-indigo-800 disabled:opacity-40 text-xs underline"
+                        :disabled="kickingEmail === m.email"
+                        @click="kickOne(focused.id, m.email)"
+                      >{{ kickingEmail === m.email ? '…' : '踢' }}</button>
+                    </td>
                   </tr>
-                  <tr v-if="!focused.cohort?.length"><td colspan="5" class="px-2 py-2 text-slate-400">尚无成员</td></tr>
+                  <tr v-if="!focused.cohort?.length"><td colspan="6" class="px-2 py-2 text-slate-400">尚无成员</td></tr>
                 </tbody>
               </table>
             </div>

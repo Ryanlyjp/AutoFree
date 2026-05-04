@@ -330,6 +330,44 @@ def runs_cancel(run_id: str) -> dict[str, Any]:
     return {"ok": cancelled, "running": runner.is_running(run_id)}
 
 
+class KickCohortReq(BaseModel):
+    emails: list[str] | None = None  # None → kick all un-kicked members
+
+
+@app.post("/api/runs/{run_id}/kick-cohort", dependencies=[Depends(require_api_key)])
+def runs_kick_cohort(run_id: str, req: KickCohortReq) -> dict[str, Any]:
+    rec = storage.get_run(run_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail=f"run {run_id} not found")
+    try:
+        mc = master.get_default_client()
+    except master.MasterAuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    cohort = rec.get("cohort") or []
+    if req.emails is not None:
+        target_emails = {e.lower().strip() for e in req.emails}
+        targets = [m for m in cohort if m.get("email", "").lower() in target_emails]
+    else:
+        targets = [m for m in cohort if not m.get("kicked")]
+
+    results = []
+    for m in targets:
+        email = m.get("email", "")
+        try:
+            ok, reason = mc.kick_user_by_email(email)
+            if ok:
+                storage.update_cohort_member(run_id, email, kicked=True)
+            results.append({"email": email, "ok": ok, "reason": reason})
+            logger.info("[api] kick-cohort %s ok=%s reason=%s", email, ok, reason)
+        except Exception as exc:
+            results.append({"email": email, "ok": False, "reason": str(exc)})
+            logger.error("[api] kick-cohort %s error: %s", email, exc)
+
+    kicked = sum(1 for r in results if r["ok"])
+    return {"kicked": kicked, "total": len(results), "results": results}
+
+
 # ============================================================ auths
 
 
