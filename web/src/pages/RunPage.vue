@@ -1,10 +1,10 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { api } from "../api.js";
 
 const props = defineProps({ master: Object });
 
-const form = reactive({ rounds: 1, per_round: 1, mail_provider: "" });
+const form = reactive({ rounds: 1, per_round: 1, mail_provider: "", register_only: false });
 const error = ref("");
 const success = ref("");
 
@@ -14,6 +14,7 @@ const probing = ref(false);
 
 const runs = ref([]);
 const focused = ref(null);
+const logRef = ref(null);
 let pollTimer = null;
 
 const cap = 10;
@@ -54,7 +55,7 @@ async function start() {
     return;
   }
   try {
-    const payload = { rounds: Number(form.rounds), per_round: Number(form.per_round) };
+    const payload = { rounds: Number(form.rounds), per_round: Number(form.per_round), register_only: form.register_only };
     if (form.mail_provider) payload.mail_provider = form.mail_provider;
     const rec = await api.runsStart(payload);
     success.value = `任务已启动 ${rec.id}`;
@@ -95,12 +96,22 @@ function startPolling() {
   }, 2500);
 }
 
-const stages = ["init", "auto_provision_off", "register", "auto_provision_on", "oauth", "kick", "done"];
+const stages = ["init", "auto_provision_off", "register", "auto_provision_on", "oauth", "kick", "done", "register_only_done"];
 function stageIdx(label) {
   return stages.indexOf(label);
 }
 
 const masterReady = computed(() => props.master?.has_session_token && props.master?.account_id);
+
+watch(
+  () => focused.value?.logs?.length,
+  async () => {
+    await nextTick();
+    if (logRef.value) {
+      logRef.value.scrollTop = logRef.value.scrollHeight;
+    }
+  }
+);
 
 onMounted(async () => {
   await probe();
@@ -146,6 +157,13 @@ onBeforeUnmount(() => {
         <div>
           <button class="btn-primary w-full" :disabled="!masterReady" @click="start">启动</button>
         </div>
+      </div>
+
+      <div class="flex items-center gap-2 text-sm">
+        <input id="register-only" v-model="form.register_only" type="checkbox" class="h-4 w-4 rounded border-slate-300" />
+        <label for="register-only" class="cursor-pointer select-none">
+          仅注册模式 <span class="text-slate-500 text-xs">(只走注册 + AP-on, 跳过 OAuth 和 kick, 可手动 auth)</span>
+        </label>
       </div>
 
       <div class="flex items-center gap-3 text-xs">
@@ -262,7 +280,7 @@ onBeforeUnmount(() => {
 
           <div>
             <h4 class="text-xs font-semibold text-slate-600 mb-1">日志</h4>
-            <pre class="bg-slate-900 text-slate-100 text-[11px] rounded p-2 max-h-64 overflow-y-auto whitespace-pre-wrap"
+            <pre ref="logRef" class="bg-slate-900 text-slate-100 text-[11px] rounded p-2 max-h-64 overflow-y-auto whitespace-pre-wrap"
             >{{ (focused.logs || []).map(l => `[${l.ts.slice(11,19)}] ${l.level.padEnd(5)} ${l.msg}`).join('\n') }}</pre>
           </div>
         </template>

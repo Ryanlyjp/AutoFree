@@ -54,6 +54,7 @@ STAGE_AP_ON = "auto_provision_on"
 STAGE_OAUTH = "oauth"
 STAGE_KICK = "kick"
 STAGE_DONE = "done"
+STAGE_REGISTER_ONLY_DONE = "register_only_done"
 
 
 # ============================================================ cancel signal
@@ -169,6 +170,7 @@ def _run_round(
     round_index: int,
     cancel: CancelSignal,
     mail_provider: str | None = None,
+    register_only: bool = False,
 ) -> dict[str, Any]:
     """Execute one round of N accounts. Returns per-round summary."""
     log = _logger_for(run_id)
@@ -262,6 +264,16 @@ def _run_round(
     master_client.set_auto_provision(True)
     _interruptible_sleep(AP_PROPAGATION_DELAY, cancel)
 
+    # ---- register_only mode: skip OAuth + kick ----
+    if register_only:
+        storage.update_run(run_id, current_stage=STAGE_REGISTER_ONLY_DONE)
+        log(f"[Round {round_index}] 仅注册模式 — 跳过 OAuth + kick,共注册 {summary['registered']} 个账号")
+        for m in cohort:
+            if m.get("ok"):
+                m["stage"] = "registered_pending_oauth"
+                storage.update_cohort_member(run_id, m["email"], m)
+        return summary
+
     # ---- 5. OAuth (serial) — force personal workspace ----
     storage.update_run(run_id, current_stage=STAGE_OAUTH)
     for i, member in enumerate(successes, 1):
@@ -333,14 +345,15 @@ def _interruptible_sleep(seconds: float, cancel: CancelSignal) -> None:
         time.sleep(min(0.5, end - time.time()))
 
 
-def _run_multi_inner(run_id: str, rounds: int, per_round: int, mail_provider: str | None) -> None:
+def _run_multi_inner(run_id: str, rounds: int, per_round: int, mail_provider: str | None, register_only: bool = False) -> None:
     log = _logger_for(run_id)
     cancel = CancelSignal()
     with _CANCELS_LOCK:
         _CANCELS[run_id] = cancel
 
     storage.update_run(run_id, status="running", started_at=_now_iso(), current_stage=STAGE_INIT)
-    log(f"=== 任务启动: rounds={rounds} per_round={per_round} ===")
+    mode_label = "仅注册" if register_only else "全流程"
+    log(f"=== 任务启动: rounds={rounds} per_round={per_round} mode={mode_label} ===")
 
     total = {"registered": 0, "oauthed": 0, "kicked": 0, "errors": []}
     final_status = "done"
@@ -356,7 +369,7 @@ def _run_multi_inner(run_id: str, rounds: int, per_round: int, mail_provider: st
             try:
                 summary = _run_round(
                     n=per_round, run_id=run_id, round_index=r, cancel=cancel,
-                    mail_provider=mail_provider,
+                    mail_provider=mail_provider, register_only=register_only,
                 )
                 total["registered"] += summary["registered"]
                 total["oauthed"] += summary["oauthed"]
@@ -397,7 +410,7 @@ def _run_multi_inner(run_id: str, rounds: int, per_round: int, mail_provider: st
     log(f"=== 任务结束: status={final_status} 注册={total['registered']} 拿token={total['oauthed']} kick={total['kicked']} ===")
 
 
-def start_run(rounds: int, per_round: int, *, mail_provider: str | None = None) -> dict[str, Any]:
+def start_run(rounds: int, per_round: int, *, mail_provider: str | None = None, register_only: bool = False) -> dict[str, Any]:
     """Validate inputs, create the run record, kick off the worker thread.
     Returns the initial run record (with `id`)."""
     rounds = int(rounds)
@@ -410,11 +423,11 @@ def start_run(rounds: int, per_round: int, *, mail_provider: str | None = None) 
     record = storage.create_run(
         rounds=rounds,
         per_round=per_round,
-        params={"mail_provider": mail_provider or "", "proxy": get_proxy()},
+        params={"mail_provider": mail_provider or "", "proxy": get_proxy(), "register_only": register_only},
     )
     threading.Thread(
         target=_run_multi_inner,
-        args=(record["id"], rounds, per_round, mail_provider),
+        args=(record["id"], rounds, per_round, mail_provider, register_only),
         name=f"autofree-run-{record['id']}",
         daemon=True,
     ).start()

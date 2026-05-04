@@ -926,6 +926,9 @@ class Flow:
         current = start_url
         last = start_url
         for hop in range(max_hops):
+            if "add-phone" in current or "add_phone" in current:
+                self.p(f"[OAuth] ⚠ add-phone gate 拦截 ({current[:80]}), 中止 follow", "warning")
+                return None, current
             r = self._api_call("get", current, step=f"follow[{hop+1}]", headers=headers, max_redirects=0)
             last = r["url"] or current
             code = _extract_code(last)
@@ -937,6 +940,9 @@ class Flow:
                     return None, last
                 if loc.startswith("/"):
                     loc = f"{OAUTH_ISSUER}{loc}"
+                if "add-phone" in loc or "add_phone" in loc:
+                    self.p(f"[OAuth] ⚠ add-phone gate 重定向 ({loc[:80]}), 中止 follow", "warning")
+                    return None, loc
                 code = _extract_code(loc)
                 if code:
                     return code, loc
@@ -1253,6 +1259,16 @@ class Flow:
         add(f"{OAUTH_ISSUER}/sign-in-with-chatgpt/codex/consent")
 
         for candidate in candidates:
+            # Check if browser already landed on add-phone gate
+            page_url_now = self._abs_auth_url(getattr(self.page, "url", "")) or ""
+            if "add-phone" in page_url_now or "add_phone" in page_url_now:
+                self.oauth_fail_reason = f"add_phone_required — consent 重定向到绑手机页 ({page_url_now[:80]})"
+                self.p(f"[OAuth] ⚠ {self.oauth_fail_reason}", "warning")
+                return None
+            if "add-phone" in candidate or "add_phone" in candidate:
+                self.p(f"[OAuth] ⚠ consent candidate 是 add-phone 页面,跳过", "warning")
+                continue
+
             self.p(f"[OAuth] consent candidate -> {candidate}")
             code = _extract_code(candidate)
             if code:
@@ -1407,6 +1423,12 @@ class Flow:
         # we POST the next thing.
         self._client_auth_session_dump(referer=self._abs_auth_url(next_url) or final0)
 
+        # add-phone gate check after step 2
+        if "add_phone" in page_type or "add-phone" in next_url or "add_phone" in next_url:
+            self.oauth_fail_reason = f"add_phone_required — step2 要求绑手机 (page_type={page_type!r})"
+            self.p(f"[OAuth] ⚠ {self.oauth_fail_reason}", "warning")
+            return None
+
         # 3/8 password verify (CONDITIONAL — see auth.har: when the just-
         # registered account is still "logged in" via chatgpt session cookies,
         # authorize/continue's response immediately points at email-otp or
@@ -1475,6 +1497,10 @@ class Flow:
             page_type = str(((data.get("page") or {}).get("type")) or page_type)
             self.p(f"[OAuth] step 3/8 ← page_type={page_type!r} next={next_url[:120]}")
             self._client_auth_session_dump(referer=self._abs_auth_url(next_url))
+            if "add_phone" in page_type or "add-phone" in next_url or "add_phone" in next_url:
+                self.oauth_fail_reason = f"add_phone_required — step3 要求绑手机 (page_type={page_type!r})"
+                self.p(f"[OAuth] ⚠ {self.oauth_fail_reason}", "warning")
+                return None
         else:
             self.p(
                 f"[OAuth] step 3/8 — **跳过 password/verify** "
@@ -1502,6 +1528,10 @@ class Flow:
                     self.p(f"[OAuth]   ✓ OTP 通过, page_type={page_type!r} next={next_url[:120]}")
                     # auth.har: GET /client_auth_session_dump after OTP validate
                     self._client_auth_session_dump(referer=self.last_otp_url)
+                    if "add_phone" in page_type or "add-phone" in next_url or "add_phone" in next_url:
+                        self.oauth_fail_reason = f"add_phone_required — OTP 后要求绑手机 (page_type={page_type!r})"
+                        self.p(f"[OAuth] ⚠ {self.oauth_fail_reason}", "warning")
+                        return None
                     ok = True
                     break
                 self.p(f"[OAuth]   ✗ OTP 拒 status={r['status']}; resend + retry", "warning")
