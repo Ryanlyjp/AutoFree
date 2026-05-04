@@ -322,20 +322,22 @@ class MasterClient:
         Returns None if user_id is missing (skip)."""
         if not isinstance(row, dict):
             return None
-        user = row.get("user") if isinstance(row.get("user"), dict) else row
+        user = row.get("user") if isinstance(row.get("user"), dict) else {}
+        # Prefer top-level user_id (the "user-xxx" format used in DELETE),
+        # then nested user.id, then row.id, then member_id.
         uid = (
-            user.get("id")
+            row.get("user_id")
+            or user.get("id")
             or row.get("id")
-            or row.get("user_id")
             or row.get("member_id")
         )
         if not uid:
             return None
-        email = (user.get("email") or row.get("email") or "").lower().strip()
+        email = (row.get("email") or user.get("email") or "").lower().strip()
         return {
             "user_id": uid,
             "email": email,
-            "name": user.get("name") or row.get("name") or "",
+            "name": row.get("name") or user.get("name") or "",
             "role": row.get("role") or user.get("role") or "",
             "status": row.get("status") or user.get("status") or "",
             "raw": row,
@@ -356,6 +358,7 @@ class MasterClient:
         rows_raw: Any = (
             body.get("items")
             or body.get("users")
+            or body.get("members")
             or body.get("data")
             or (body if isinstance(body, list) else [])
         )
@@ -490,12 +493,38 @@ class MasterClient:
         logger.info("[master] kick user_id=%s ok=%s", user_id, ok)
         return ok
 
-    def kick_user_by_email(self, email: str) -> tuple[bool, str]:
-        """Returns (success, reason). reason is non-empty when success=False
-        so the runner can surface it to the run log."""
-        uid = self.find_user_id_by_email(email)
+    def kick_user_by_email(
+        self, email: str, *, lookup_retries: int = 3, retry_interval: float = 3.0
+    ) -> tuple[bool, str]:
+        """Returns (success, reason). reason is non-empty when success=False.
+
+        Retries the member-list lookup up to `lookup_retries` times with
+        `retry_interval` seconds between attempts because OpenAI has a sync
+        delay: a user who just joined via auto_provision may not appear in
+        /users immediately. Only after all retries miss do we declare absent.
+        """
+        target = (email or "").strip().lower()
+        total_attempts = max(1, lookup_retries + 1)
+        uid: str | None = None
+
+        for attempt in range(total_attempts):
+            uid = self.find_user_id_by_email(target)
+            if uid:
+                break
+            if attempt < total_attempts - 1:
+                logger.info(
+                    "[master] kick: %s 暂未在成员列表中 (OpenAI 同步延迟?), %.1fs 后重试 (%d/%d)",
+                    target, retry_interval, attempt + 1, total_attempts - 1,
+                )
+                time.sleep(retry_interval)
+
         if not uid:
-            return False, f"在 master workspace 成员列表里找不到 {email} (可能被自动转去 personal 了, 或分页没拉全)"
+            logger.info(
+                "[master] kick: 重试 %d 次后仍未找到 %s, 视为已不在 Team (already_absent)",
+                total_attempts, target,
+            )
+            return True, "already_absent"
+
         try:
             ok = self.kick_user_by_id(uid)
         except Exception as exc:
