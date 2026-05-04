@@ -39,6 +39,7 @@ from playwright.sync_api import sync_playwright
 
 from autofree.config import EMAIL_POLL_TIMEOUT
 from autofree.mail.base import MailProvider
+from autofree.proxy import build_browser_proxy, parse_proxy_config
 
 logger = logging.getLogger(__name__)
 
@@ -100,13 +101,6 @@ def _random_chrome_version() -> tuple[str, str, str]:
         f"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{full} Safari/537.36"
     )
     return full, ua, p["ua"]
-
-
-def _normalize_proxy(proxy: str | None) -> str | None:
-    raw = str(proxy or "").strip()
-    if not raw:
-        return None
-    return raw if "://" in raw else f"http://{raw}"
 
 
 def _extract_code(url: str) -> str | None:
@@ -182,7 +176,7 @@ class Flow:
         master_account_id: str | None = None,
     ):
         self.tag = tag
-        self.proxy = _normalize_proxy(proxy)
+        self.proxy = parse_proxy_config(proxy)
         self.headless = bool(headless)
         self.mail_client = mail_client
         self.otp_timeout = int(otp_timeout)
@@ -209,6 +203,7 @@ class Flow:
         self.page = None
         self.sentinel_page = None
         self.api = None
+        self.browser_proxy = build_browser_proxy(self.proxy)
 
         self.callback_url = ""
         self.captured_code: str | None = None
@@ -247,30 +242,36 @@ class Flow:
         self._mailbox_id = mailbox_id
 
     def start(self) -> None:
-        self.playwright = sync_playwright().start()
-        launch: dict[str, Any] = {"headless": self.headless, "slow_mo": PLAYWRIGHT_SLOW_MO_MS}
-        if self.proxy:
-            launch["proxy"] = {"server": self.proxy}
-        self.browser = self.playwright.chromium.launch(**launch)
-        self.context = self.browser.new_context(
-            user_agent=self.ua,
-            locale="en-US",
-            viewport={"width": 1600, "height": 980},
-            ignore_https_errors=True,
-        )
-        self.context.set_default_timeout(PLAYWRIGHT_TIMEOUT_MS)
-        self._prime_cookies()
-        self.page = self.context.new_page()
-        self.sentinel_page = self.context.new_page()
-        self._hook_code_capture(self.page)
-        self._hook_code_capture(self.sentinel_page)
         try:
-            self.sentinel_page.goto(SENTINEL_FRAME_URL, wait_until="domcontentloaded", timeout=PLAYWRIGHT_TIMEOUT_MS)
-            self.sentinel_page.wait_for_timeout(3000)
-        except Exception as e:
-            self.p(f"[Sentinel] open failed: {e}")
-        self._sync_api_from_browser()
-        self.p(f"[Playwright] ready proxy={self.proxy or 'none'} headless={self.headless}")
+            self.browser_proxy.start()
+            self.playwright = sync_playwright().start()
+            launch: dict[str, Any] = {"headless": self.headless, "slow_mo": PLAYWRIGHT_SLOW_MO_MS}
+            launch_proxy = self.browser_proxy.playwright()
+            if launch_proxy:
+                launch["proxy"] = launch_proxy
+            self.browser = self.playwright.chromium.launch(**launch)
+            self.context = self.browser.new_context(
+                user_agent=self.ua,
+                locale="en-US",
+                viewport={"width": 1600, "height": 980},
+                ignore_https_errors=True,
+            )
+            self.context.set_default_timeout(PLAYWRIGHT_TIMEOUT_MS)
+            self._prime_cookies()
+            self.page = self.context.new_page()
+            self.sentinel_page = self.context.new_page()
+            self._hook_code_capture(self.page)
+            self._hook_code_capture(self.sentinel_page)
+            try:
+                self.sentinel_page.goto(SENTINEL_FRAME_URL, wait_until="domcontentloaded", timeout=PLAYWRIGHT_TIMEOUT_MS)
+                self.sentinel_page.wait_for_timeout(3000)
+            except Exception as e:
+                self.p(f"[Sentinel] open failed: {e}")
+            self._sync_api_from_browser()
+            self.p(f"[Playwright] ready proxy={self.browser_proxy.display_url} headless={self.headless}")
+        except Exception:
+            self.close()
+            raise
 
     def close(self, keep_open: bool = False) -> None:
         for name in ("api", "sentinel_page", "page", "context", "browser"):
@@ -289,6 +290,8 @@ class Flow:
                 self.playwright.stop()
             except Exception:
                 pass
+        self.playwright = None
+        self.browser_proxy.close()
 
     # ============================================================ cookies / browser↔api bridge
 
@@ -360,8 +363,9 @@ class Flow:
                 "sec-ch-ua-platform": '"Windows"',
             },
         }
-        if self.proxy:
-            kwargs["proxy"] = {"server": self.proxy}
+        launch_proxy = self.browser_proxy.playwright()
+        if launch_proxy:
+            kwargs["proxy"] = launch_proxy
         self.api = self.playwright.request.new_context(**kwargs)
 
     def _sync_browser_from_api(self) -> None:
@@ -1620,13 +1624,18 @@ def master_playwright_login(
     """
     from autofree import admin_state, master  # late import to avoid cycle
 
-    proxy = _normalize_proxy(proxy)
-    pw = sync_playwright().start()
-    launch: dict[str, Any] = {"headless": headless, "slow_mo": PLAYWRIGHT_SLOW_MO_MS}
-    if proxy:
-        launch["proxy"] = {"server": proxy}
-    browser = pw.chromium.launch(**launch)
+    proxy = parse_proxy_config(proxy)
+    browser_proxy = build_browser_proxy(proxy)
+    pw = None
+    browser = None
     try:
+        browser_proxy.start()
+        pw = sync_playwright().start()
+        launch: dict[str, Any] = {"headless": headless, "slow_mo": PLAYWRIGHT_SLOW_MO_MS}
+        launch_proxy = browser_proxy.playwright()
+        if launch_proxy:
+            launch["proxy"] = launch_proxy
+        browser = pw.chromium.launch(**launch)
         ctx = browser.new_context(
             user_agent=_random_chrome_version()[1],
             viewport={"width": 1280, "height": 800},
@@ -1707,11 +1716,14 @@ def master_playwright_login(
         info = master.import_session_token(session_token, account_id=account_id, email=email)
         return info
     finally:
-        try:
-            browser.close()
-        except Exception:
-            pass
-        try:
-            pw.stop()
-        except Exception:
-            pass
+        if browser:
+            try:
+                browser.close()
+            except Exception:
+                pass
+        if pw:
+            try:
+                pw.stop()
+            except Exception:
+                pass
+        browser_proxy.close()

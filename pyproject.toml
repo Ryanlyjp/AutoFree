@@ -7,7 +7,7 @@ dependencies = [
     "fastapi>=0.115",
     "playwright>=1.40.0",
     "pydantic>=2.6",
-    "requests>=2.28.0",
+    "requests[socks]>=2.28.0",
     "uvicorn[standard]>=0.30",
     "xvfbwrapper>=0.2.9; sys_platform == 'linux'",
 ]

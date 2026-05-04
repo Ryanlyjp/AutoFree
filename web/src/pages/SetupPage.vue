@@ -236,12 +236,18 @@ onMounted(async () => {
     <section class="card space-y-3">
       <header class="flex items-center justify-between">
         <h2 class="text-base font-semibold">代理</h2>
-        <span class="text-xs text-slate-500">所有 Playwright 流量走此代理。留空 = 不使用</span>
+        <span class="text-xs text-slate-500">浏览器和后端请求都会走此代理。留空 = 不使用</span>
       </header>
       <div class="grid grid-cols-3 gap-3">
         <div class="col-span-2">
-          <label class="label">HTTP/HTTPS Proxy URL</label>
-          <input v-model="proxyForm.value" class="input" placeholder="http://127.0.0.1:7890" />
+          <label class="label">Proxy URL</label>
+          <input v-model="proxyForm.value" class="input" placeholder="socks5://127.0.0.1:1080" />
+          <p class="mt-2 text-xs text-slate-500">
+            格式说明：填写一个完整 URL，不是 <code>IP,PORT,USER,PWD</code>。
+            例如 <code>http://127.0.0.1:7890</code>、
+            <code>socks5://127.0.0.1:1080</code>、
+            <code>socks5://user:pass@127.0.0.1:1080</code>。
+          </p>
         </div>
         <div class="self-end">
           <button class="btn-primary w-full" @click="saveProxy">保存</button>

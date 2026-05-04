@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 from autofree import admin_state, cpa_push, master, runner, storage
 from autofree.config import get_api_key
 from autofree.mail import get_mail_client
+from autofree.proxy import ProxyConfigError, normalize_proxy_url
 from autofree.settings import get_all as settings_get_all
 from autofree.settings import update as settings_update
 
@@ -91,7 +92,10 @@ def settings_get() -> dict[str, Any]:
 def settings_patch(patch: SettingsPatch) -> dict[str, Any]:
     update_payload: dict[str, Any] = {}
     if patch.proxy is not None:
-        update_payload["proxy"] = patch.proxy
+        try:
+            update_payload["proxy"] = normalize_proxy_url(patch.proxy) or ""
+        except ProxyConfigError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     if patch.mail is not None:
         update_payload["mail"] = patch.mail
     if patch.cpa is not None:

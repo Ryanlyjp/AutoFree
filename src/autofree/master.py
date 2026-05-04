@@ -28,6 +28,7 @@ from urllib.parse import quote
 import requests
 
 from autofree import admin_state
+from autofree.proxy import build_requests_proxy_map, normalize_proxy_url
 from autofree.settings import get_proxy
 
 logger = logging.getLogger(__name__)
@@ -76,9 +77,12 @@ class MasterClient:
         self._access_token_fetched_at: float = 0.0
 
         self.session = requests.Session()
+        self.session.trust_env = False
         proxy = proxy if proxy is not None else get_proxy()
-        if proxy:
-            self.session.proxies = {"http": proxy, "https": proxy}
+        self.proxy = normalize_proxy_url(proxy)
+        proxies = build_requests_proxy_map(self.proxy)
+        if proxies:
+            self.session.proxies = proxies
 
     # ------------------------------------------------------------ headers / cookies
 
