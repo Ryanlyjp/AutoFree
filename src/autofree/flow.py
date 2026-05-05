@@ -1438,6 +1438,8 @@ class Flow:
         # invalid_state. The chatgpt server requires very specific state
         # progression — when our session cookies don't line up, it returns
         # 409 and tells us to "start over".
+        oauth_otp_baseline_ids = self._snapshot_recent_email_ids(email, size=12)
+
         def _do_authorize_continue() -> dict:
             headers = self._json_headers(
                 final0 if str(final0).startswith(OAUTH_ISSUER) else f"{OAUTH_ISSUER}/log-in",
@@ -1567,7 +1569,7 @@ class Flow:
             self.p(f"[OAuth] step 4/8 — OAuth 阶段需要二次 OTP @ {self.last_otp_url}")
             ok = False
             last_status = 0
-            ignore_email_ids = self._snapshot_recent_email_ids(email, size=12)
+            ignore_email_ids = set(oauth_otp_baseline_ids)
             ignore_codes: set[str] = set()
             soft_retry_used = False
             wait_before_fetch = 3.0
