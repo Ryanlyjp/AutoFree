@@ -2,9 +2,7 @@
 
 # AutoFree
 
-**ChatGPT Personal `plan_type=free` 批量生产工具**
-
-基于 [AutoTeam-Free](https://github.com/ZRainbow1275/AutoTeam-F) 的 free 链路 + [daily-playwright](daily-playwright.py) 注册脚本，重写为单一职责的精简版本。CTF 专用。
+批量生产 ChatGPT Personal `plan_type=free` 账号 OAuth `auth.json` 的本地工具，支持 Web 面板、CLI、Docker 部署，以及推送到 CLIProxyAPI。
 
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![Playwright](https://img.shields.io/badge/Playwright-Chromium-2EAD33?style=flat-square&logo=playwright&logoColor=white)](https://playwright.dev)
@@ -16,238 +14,387 @@
 
 ---
 
-## 它是什么 / 它不是什么
+## 项目概览
 
-**是**：把母号 (ChatGPT Team) 当跳板，**批量** 生产 Personal 免费号的 Codex OAuth `auth.json`，再把 `auth.json` 推到 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 当作免费的 `plan_type=free` 后端用。
+AutoFree 面向本地实验、自动化验证和 CTF/研究场景，核心目标是：
 
-**不是**：通用账号管理面板。**没有** 轮转、巡检、Team 子号补位、CPA 反向同步等能力 — 那些在 [AutoTeam-Free](https://github.com/ZRainbow1275/AutoTeam-F) 里。AutoFree 砍到只剩一条主线。
+1. 使用母号完成 Team 侧的注册与编排。
+2. 为新号执行 OAuth 流程并固定选择 personal workspace。
+3. 落盘生成可复用的 `auth.json`。
+4. 按需将 `auth.json` 推送到 CLIProxyAPI。
+
+产物默认保存在 `data/auths/`，运行过程和日志保存在 `data/runs/`。
 
 ---
 
-## 核心流程（这是我们要做的事情）
+## 当前功能
 
-每一轮 `N` 个号、共 `R` 轮、全部串行：
+- 批量运行：支持 `rounds × per_round` 多轮串行任务。
+- 注册流程：自动完成注册、邮箱 OTP、资料补全。
+- OAuth 流程：自动执行 PKCE、二次 OTP、workspace 选择和 token 交换。
+- Personal 强制选择：优先选择 personal workspace，避免拿到 team token。
+- 邮箱后端：支持 `tempmail`、`cf_temp_email`、`maillab`。
+- 代理支持：支持 HTTP/HTTPS/SOCKS5，Web UI 可直接修改。
+- 母号管理：支持导入 `session_token`、`access_token`、`account_id`。
+- 任务控制：支持运行、查看日志、查看历史、取消当前批次。
+- 仅注册模式：支持跳过 OAuth/kick，仅完成注册阶段。
+- Auth 管理：支持查看、删除、单个推送、批量推送到 CPA。
+- Docker 部署：内置 Chromium、xvfb、前端构建流程。
+- CLI 入口：支持本地命令行启动 API、运行任务和推送产物。
+
+---
+
+## 工作流
 
 ```text
-关 auto_provision  ←─  /backend-api/accounts/{id}/settings/auto_provision {"value":false}
-        ↓
-[串行 ×N] gpt.har 流程注册 free 号
-        ↓                  ├─ /api/auth/csrf
-        ↓                  ├─ /api/auth/signin/openai
-        ↓                  ├─ /api/accounts/user/register
-        ↓                  ├─ /api/accounts/email-otp/send  →  邮箱后端 wait_for_otp
-        ↓                  ├─ /api/accounts/email-otp/validate
-        ↓                  └─ /api/accounts/create_account  (name + birthdate)
-        ↓
-开 auto_provision  ←─  让 verified-domain 的号在下一步 OAuth 时自动归到 Personal workspace
-        ↓
-[串行 ×N] auth.har 流程做 Codex OAuth，强制选 personal workspace
-        ↓                  ├─ /oauth/authorize  (PKCE)
-        ↓                  ├─ /api/accounts/authorize/continue
-        ↓                  ├─ /api/accounts/password/verify
-        ↓                  ├─ (二次) /api/accounts/email-otp/validate
-        ↓                  ├─ /api/accounts/workspace/select  ← 关键，挑 personal
-        ↓                  ├─ consent 自动点击
-        ↓                  └─ /oauth/token  →  access_token / refresh_token / id_token
-        ↓
-落盘 data/auths/{email}.json  (codex CLI / CPA 兼容格式)
-        ↓
-[串行 ×N] 母号 kick 这一批 free 号
-                                   └─ DELETE /backend-api/accounts/{id}/users/{user_id}
-        ↓
-等用户在 Web 上手动点 "推送 → CPA"   (不会动 CPA 上已存在的文件)
+关闭 auto_provision
+  -> 批量注册新号
+  -> 打开 auto_provision
+  -> 等待设置生效
+  -> 批量执行 OAuth
+  -> 强制选择 personal workspace
+  -> 生成并保存 auth.json
+  -> 可选推送到 CLIProxyAPI
+  -> 可选把本轮账号从 Team 踢出
 ```
 
-> 容量约束：单轮 `N + 当前 Team 成员数 ≤ 10`，前端会提前校验。
+对应的核心模块：
+
+- `src/autofree/flow.py`：注册与 OAuth 自动化。
+- `src/autofree/master.py`：母号的 Team/identity/backend-api 操作。
+- `src/autofree/runner.py`：批量编排、状态推进、取消逻辑。
+- `src/autofree/api.py`：Web/API 入口。
+- `src/autofree/cpa_push.py`：`auth.json` 生成与 CPA 推送。
 
 ---
 
-## 特性
+## 运行前准备
 
-| | 功能 | 说明 |
-|---|---|---|
-| 🆓 | **批量生产 free 号** | 单轮 1-10 个，多轮串行；Team 容量校验前置 |
-| 🔁 | **auto_provision 程序化** | 关→注册→开→OAuth 的精确编排，一键完成 |
-| 📧 | **三种邮箱后端** | `tempmail`(自托管) / `cf_temp_email`(dreamhunter2333) / `maillab` |
-| 🌐 | **网页配置代理** | proxy 在 web UI 改，不需要改 .env 重启 |
-| 🔐 | **母号双链路登录** | session_token 直接导入 (推荐) + Playwright 邮箱密码登录 |
-| 🛑 | **协作式取消** | Web "cancel" 按钮 / `cancel_run()` API,跑到当前安全点退出 |
-| 📊 | **任务进度可视化** | stepper + cohort 表 + 实时日志，浏览器端 2.5s 轮询 |
-| 📤 | **CPA 推送只入库** | 自动落盘但不主动推；前端多选→push;有同名前缀防误覆盖 |
-| 🐍 | **CLI + Web 双入口** | `autofree run -R 3 -n 2` 或 `autofree api` |
+开始部署前，请先确认以下条件：
+
+1. 具备 Python 3.10+ 环境。
+2. 如需本地源码运行，具备 Node.js 18+ 环境。
+3. 机器能够通过代理访问 OpenAI 相关站点。
+4. 具备一个可用的 ChatGPT Team 母号。
+5. 母号侧已配置 Verified Domain，且能使用 Identity & Access 的 `auto_provision`。
+6. 至少准备一个可用邮箱后端。
 
 ---
 
-## 30 秒上手
+## 部署方式
 
-### 方式 A：一键脚本（推荐）
+### 方式一：Docker
+
+适合直接起服务，本机只保留源码和 `data/` 持久化目录。
 
 ```bash
+git clone <your-fork-or-repo-url> AutoFree
 cd AutoFree
-bash setup.sh                  # uv sync + playwright install chromium + frontend build + 生成 .env
-uv run autofree api            # http://0.0.0.0:8788
+docker compose up -d --build
 ```
 
-### 方式 B：Docker
+启动后：
+
+1. 服务默认监听 `http://127.0.0.1:8788`。
+2. API Key 会自动写入 `data/.env`。
+3. 首次构建会安装 Python 依赖、Playwright Chromium、前端依赖，耗时会明显更长。
+
+查看 API Key：
 
 ```bash
-cd AutoFree
-docker compose up -d --build   # 自带 chromium + xvfb,首次 build 约 5 分钟
-# API key 在 data/.env(自动生成),用 `docker logs autofree | grep API_KEY` 看
+cat data/.env
 ```
 
-### 方式 C：手动
+查看容器状态和日志：
 
 ```bash
-cd AutoFree
-uv sync                                       # 或 pip install -e .
-uv run playwright install chromium            # ⚠️  必跑,否则 Flow.start() 会崩
-uv run playwright install-deps chromium       # Linux 装 chromium 系统依赖
+docker compose ps
+docker compose logs -f
+```
 
+停止服务：
+
+```bash
+docker compose down
+```
+
+### 方式二：本地源码运行
+
+适合调试、改代码和直接观察运行日志。
+
+```bash
+git clone <your-fork-or-repo-url> AutoFree
+cd AutoFree
+uv sync
+uv run playwright install chromium
+uv run playwright install-deps chromium
 cd web && npm install && npm run build && cd ..
+```
 
-mkdir -p data && echo 'AUTOFREE_API_KEY=change-me' > data/.env
+初始化运行目录并启动 API：
+
+```bash
+mkdir -p data
+echo "AUTOFREE_API_KEY=change-me" > data/.env
 uv run autofree api
 ```
 
-> ⚠️ **Playwright Chromium 不会自动装**。漏了这一步,启动 Run 任务时会报
-> `BrowserType.launch: Executable doesn't exist at /root/.cache/ms-playwright/...`
-> setup.sh 和 Dockerfile 都帮你做了;手动安装务必跑 `playwright install chromium`。
+Linux/macOS 也可以直接使用：
 
-启动后浏览器访问 `http://<host>:8788` → 输入 API Key → Setup 配齐 → Run 启动。
-
-**完整教程**：[docs/getting-started.md](docs/getting-started.md)
-
----
-
-## CLI 命令
-
-```text
-autofree api                          启动 Web + API （默认 8788)
-autofree run -R 3 -n 2                跑 3 轮 × 2 个号 （阻塞，CLI 看日志）
-autofree status                       看母号状态 + 已生产 auth + 历史任务
-autofree push <email>                 推一个 auth.json 到 CPA
-autofree push-all                     推所有未推送的
-autofree import-token                 stdin 粘贴 master session_token
-autofree set-account-id <id>          手动覆盖 master 的 workspace account_id
-```
-
-跑 `autofree <command> -h` 看每个子命令的参数。
-
----
-
-## Web 面板
-
-| 页 | 功能 |
-|---|---|
-| **Setup** | 改 proxy / 选邮箱后端并填配置 / 填 CPA / 导入 master session_token / probe 测连通 |
-| **Run** | 启动批次 (rounds × per_round) / 实时进度 stepper / cohort 表 / 日志 / cancel |
-| **Auths** | 已落盘 auth 列表 / 多选推送 CPA / 详情查看 (token 脱敏) / 删除本地 |
-
-启动 `autofree api` 后访问 `http://localhost:8788`。
-
----
-
-## 设计原则
-
-| 决策 | 取舍 |
-|---|---|
-| 砍掉 Team 轮转、巡检、CPA 反向同步 | 单一职责，CTF 用不上 |
-| 全流程串行 | 浏览器并发会触发 IP 风控；串行慢但稳 |
-| OAuth 强制选 personal workspace | 这是拿到 `plan_type=free` 的关键，不留 fallback 给 team |
-| CPA push 只入库不自动推 | 出错可以 review，CPA 不会被半成品污染 |
-| 文件名前缀 `codex-free-` | 跟 AutoTeam Team 模式的 CPA 文件不撞 |
-| 配置在 `data/settings.json` 而非 .env | 网页能改，重启即生效；.env 只剩 `AUTOFREE_API_KEY` |
-| 母号优先 session_token 导入 | Playwright 登录依赖 chatgpt 登录页结构稳定，靶场环境 cookie 一句话 |
-
----
-
-## 项目结构
-
-```text
-AutoFree/
-├── pyproject.toml
-├── setup.sh                        一键安装脚本(uv + playwright + npm + .env)
-├── Dockerfile                      容器镜像(自带 chromium + xvfb + 前端 build)
-├── docker-compose.yml              单服务编排,挂载 ./data
-├── docker-entrypoint.sh            启动时跑 xvfb + 自检关键 import
-├── .env.example                    复制成 data/.env,只需要 AUTOFREE_API_KEY
-├── README.md                       本文档
-├── docs/                           详细文档
-│   ├── getting-started.md          首次部署 + 跑通单号
-│   ├── configuration.md            settings.json + 邮箱后端 + 母号
-│   ├── api.md                      HTTP 端点参考
-│   ├── architecture.md             模块图 + 数据流
-│   └── troubleshooting.md          常见问题
-├── src/autofree/
-│   ├── config.py                   path 常量 + .env loader
-│   ├── settings.py                 网页可改的运行时配置
-│   ├── admin_state.py              母号 session_token 持久化
-│   ├── storage.py                  data/auths/ + data/runs/ 读写
-│   ├── master.py                   chatgpt.com /backend-api 客户端
-│   │                                 ├ auto_provision toggle
-│   │                                 ├ list_members / kick_user_by_email
-│   │                                 └ verify_session / import_session_token
-│   ├── mail/                       邮箱后端
-│   │   ├── base.py                 MailProvider 抽象 + OTP 提取
-│   │   ├── cf_temp_email.py        dreamhunter2333/cloudflare_temp_email
-│   │   ├── maillab.py              maillab/cloud-mail
-│   │   └── tempmail.py             /opt/code-server/project/tempmail (新增)
-│   ├── flow.py                     Playwright register + OAuth-personal-forced
-│   ├── runner.py                   多轮编排,后台线程 + cancel signal
-│   ├── cpa_push.py                 CLIProxyAPI 推送 (add-only)
-│   ├── api.py                      FastAPI 22 个端点 + 静态前端
-│   ├── cli.py                      argparse 子命令
-│   └── web/dist/                   前端 npm build 输出 (不入库)
-├── web/                            Vue 3 + Vite + Tailwind
-│   ├── src/api.js                  fetch 包装
-│   ├── src/App.vue                 顶层导航 + key handshake
-│   └── src/pages/
-│       ├── SetupPage.vue
-│       ├── RunPage.vue
-│       └── AuthsPage.vue
-└── data/                           运行时数据 (gitignore)
-    ├── .env                        本地配置 (只放 AUTOFREE_API_KEY)
-    ├── settings.json               proxy / mail / cpa,网页可改
-    ├── admin_state.json            母号 session_token + account_id (0600)
-    ├── auths/{email}.json          每个 free 号的 auth (0600)
-    ├── runs/{run_id}.json          任务历史 + 完整日志
-    └── logs/                       预留
+```bash
+bash setup.sh
+uv run autofree api
 ```
 
 ---
 
-## 文档导航
+## 首次配置
 
-| 想做的事 | 看哪一份 |
-|---|---|
-| 第一次部署，跑通一个 free 号 | [getting-started.md](docs/getting-started.md) |
-| 配某个邮箱后端 / 改 proxy / 导入母号 | [configuration.md](docs/configuration.md) |
-| 用脚本调 HTTP API | [api.md](docs/api.md) |
-| 想看每一步在哪个文件 / 哪个 commit | [architecture.md](docs/architecture.md) |
-| 报错了 / 卡死了 / OAuth 拿不到 personal | [troubleshooting.md](docs/troubleshooting.md) |
+服务启动后，浏览器打开 `http://127.0.0.1:8788`，按以下顺序配置。
+
+### 1. 登录 Web 面板
+
+1. 打开页面。
+2. 输入 `data/.env` 里的 `AUTOFREE_API_KEY`。
+3. 进入 `Setup` 页面。
+
+### 2. 配置代理
+
+在 `Setup` 页面填写 `proxy`。
+
+常见格式：
+
+```text
+http://127.0.0.1:7890
+https://127.0.0.1:7890
+socks5://127.0.0.1:1080
+```
+
+如果 AutoFree 运行在 Docker 容器中，容器内访问宿主机代理时应填写：
+
+```text
+http://host.docker.internal:7890
+```
+
+不要在 Docker 容器里填 `127.0.0.1:7890`，那会指向容器自身。
+
+### 3. 配置邮箱后端
+
+支持三种后端：
+
+1. `tempmail`
+2. `cf_temp_email`
+3. `maillab`
+
+按后端类型填写对应的 `base_url/api_url`、认证信息和域名，然后使用页面上的测试功能确认后端可用。
+
+### 4. 配置母号
+
+推荐填写：
+
+1. `session_token`
+2. `access_token`
+3. `account_id`
+4. 可选 `email`
+
+建议从浏览器抓母号真实登录态：
+
+1. 在 `chatgpt.com` 登录母号。
+2. 从 Cookie 中提取 `__Secure-next-auth.session-token`。
+3. 从 `/api/auth/session` 响应中提取 `accessToken`。
+4. 从 `/api/auth/session` 或请求头中提取 `default_workspace_id/chatgpt-account-id`。
+
+### 5. 可选配置 CLIProxyAPI
+
+如果你需要自动推送 `auth.json`，再填写：
+
+1. `CPA base_url`
+2. `CPA key`
+
+未配置时不影响本地产物落盘。
+
+---
+
+## 使用步骤
+
+### 1. 启动批次任务
+
+打开 `Run` 页面，设置：
+
+1. `rounds`
+2. `per_round`
+3. 是否启用 `register_only`
+
+然后点击开始。
+
+### 2. 观察任务状态
+
+运行期间可以在 `Run` 页面查看：
+
+1. 当前阶段
+2. 每个账号的状态
+3. 实时日志
+4. 历史任务
+
+如果需要停止，可以使用页面上的 `cancel`。
+
+### 3. 查看产物
+
+成功后到 `Auths` 页面查看生成结果，或直接检查本地目录：
+
+```bash
+ls data/auths
+```
+
+每个账号会生成一个对应的 `*.json`。
+
+### 4. 推送到 CPA
+
+在 `Auths` 页面可以：
+
+1. 推送单个 auth
+2. 批量推送 auth
+3. 删除本地 auth
+
+---
+
+## CLI 用法
+
+```text
+autofree api
+autofree run -R 3 -n 2
+autofree status
+autofree push <email>
+autofree push-all
+autofree import-token
+autofree set-account-id <id>
+```
+
+常用示例：
+
+```bash
+uv run autofree api
+uv run autofree run -R 1 -n 1
+uv run autofree status
+```
+
+---
+
+## Web 页面说明
+
+### Setup
+
+用于配置：
+
+1. 代理
+2. 邮箱后端
+3. CLIProxyAPI
+4. 母号登录态
+
+### Run
+
+用于：
+
+1. 启动批次
+2. 查看实时进度
+3. 查看运行日志
+4. 取消当前任务
+
+### Auths
+
+用于：
+
+1. 查看落盘的 `auth.json`
+2. 删除本地 auth
+3. 推送到 CPA
+
+---
+
+## 数据目录
+
+```text
+data/
+├── .env
+├── settings.json
+├── admin_state.json
+├── auths/
+├── runs/
+└── logs/
+```
+
+说明：
+
+- `data/.env`：API Key 等少量启动配置。
+- `data/settings.json`：代理、邮箱、CPA 等运行配置。
+- `data/admin_state.json`：母号凭据与状态。
+- `data/auths/`：生成的 `auth.json`。
+- `data/runs/`：批次记录和完整日志。
+
+---
+
+## 配置优先级
+
+1. `data/settings.json`
+2. `data/.env`
+3. 代码默认值
+
+Web UI 修改的大部分配置都会写入 `data/settings.json`，后续任务直接读取该文件。
 
 ---
 
 ## 已知限制
 
-- **必须有 verified domain** + 母号 Identity & Access 里能配 auto_provision；这是项目能跑的前提。如果母号没有 verified domain，跑不通 — 因为 free 号注册后需要靠 verified-domain 自动加入 Team workspace 才能在 OAuth 时拿到 personal 选项。
-- **IP 风控**：VPS / 数据中心 IP 容易被 OpenAI 标记为 abuse；建议给 proxy 配住宅。
-- **Cloudflare 5 秒挑战**：母号 session_token 必须从已通过 Cloudflare 的会话里复制，不然 master client 直接 403。
-- **OAuth `add-phone` gate**：理论上 OpenAI 可能要求新号绑手机号；本项目 **没有** 处理这个分支（CTF 母号一般不会触发）。如果遇到，参考 daily-playwright.py 的 `_report_add_phone`。
-- **soft-cancel 不打断当前账号**：取消后会跑完当前正在注册/OAuth 的那一个号才退出；不暴力关浏览器。
+1. 必须有 Verified Domain 和可用的 `auto_provision`。
+2. 数据中心 IP 更容易触发风控，建议使用质量更好的代理和域名邮箱。
+3. 母号 `session_token` 需要来自已通过 Cloudflare 的真实会话。
+4. `OAuth add-phone` 分支目前没有自动处理逻辑。
+5. 取消任务是协作式取消，不会暴力终止当前账号执行到一半的浏览器流程。
 
 ---
 
-## 免责声明
+## 故障排查
 
-本项目仅供学习研究、CTF 比赛使用。使用本工具可能违反 OpenAI 服务条款。账号封禁、IP 限制、CLIProxyAPI 数据污染等后果由使用者自担。
+常见排查入口：
+
+1. `docs/getting-started.md`
+2. `docs/configuration.md`
+3. `docs/api.md`
+4. `docs/architecture.md`
+5. `docs/troubleshooting.md`
+
+常用命令：
+
+```bash
+docker compose logs -f
+uv run autofree status
+```
+
+---
 
 ## 致谢
 
-- [cnitlrt/AutoTeam](https://github.com/cnitlrt/AutoTeam) — 上游骨架
-- [ZRainbow1275/AutoTeam-F](https://github.com/ZRainbow1275/AutoTeam-F) — free 链路 + workspace 选择修复
-- [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) — 推送目标
-- 本机 `daily-playwright.py` — 提供注册 + OAuth 网络层验证过的实现
+本项目在设计和实现过程中参考了以下项目与社区：
 
-License: MIT
+1. [ZRainbow1275/AutoTeam-F](https://github.com/ZRainbow1275/AutoTeam-F)  
+   本项目的二开参考，特别是在整体流程拆解方面提供了直接启发。
+2. [cnitlrt/AutoTeam](https://github.com/cnitlrt/AutoTeam)  
+   上游自动化流程和整体思路的重要来源。
+3. [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)  
+   为 `auth.json` 推送与后续消费提供了目标接口与使用场景。
+4. [LinuxDo](https://linux.do/)  
+  
+
+---
+
+## 友链
+
+1. [AutoTeam-F](https://github.com/ZRainbow1275/AutoTeam-F)
+2. [AutoTeam](https://github.com/cnitlrt/AutoTeam)
+3. [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
+4. [LinuxDo](https://linux.do/)
+
+---
+
+## License
+
+MIT

@@ -63,9 +63,8 @@ SENTINEL_SDK_VERSION = "20260219f9f6"
 SENTINEL_FRAME_URL = f"{SENTINEL_BASE}/backend-api/sentinel/frame.html?sv={SENTINEL_SDK_VERSION}"
 
 _CHROME_PROFILES = [
-    {"major": 131, "build": 6778, "patch": (69, 205), "ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'},
-    {"major": 133, "build": 6943, "patch": (33, 153), "ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"'},
-    {"major": 136, "build": 7103, "patch": (48, 175), "ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"'},
+    # Match the browser fingerprint seen in the known-good auth.har capture.
+    {"major": 147, "build": 0, "patch": (0, 0), "ua": '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"'},
 ]
 
 
@@ -385,6 +384,13 @@ class Flow:
             "sec-ch-ua-platform": '"Windows"',
         }
 
+    def _same_origin_fetch_headers(self) -> dict[str, str]:
+        return {
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        }
+
     def _json_headers(self, referer: str, origin: str) -> dict[str, str]:
         h = {
             "Content-Type": "application/json",
@@ -394,6 +400,7 @@ class Flow:
             "oai-device-id": self.device_id,
         }
         h.update(self._std())
+        h.update(self._same_origin_fetch_headers())
         h.update(_trace_headers())
         return h
 
@@ -496,7 +503,14 @@ class Flow:
 
     # ============================================================ OTP plumbing (via mail_client)
 
-    def _wait_otp(self, email: str) -> str:
+    def _wait_otp(
+        self,
+        email: str,
+        *,
+        initial_delay: float = 0.0,
+        ignore_email_ids: set[str] | None = None,
+        ignore_codes: set[str] | None = None,
+    ) -> str:
         """Pull the next OTP for `email` from the mail backend.
 
         Logs which mailbox id we're polling and how long the timeout is, so
@@ -506,10 +520,16 @@ class Flow:
         if not self.mail_client:
             raise FlowError("Flow.mail_client 未注入,无法拉 OTP")
         provider = getattr(self.mail_client, "provider_name", "?")
+        ignored_ids = len(ignore_email_ids or ())
+        ignored_codes = len(ignore_codes or ())
         self.p(
             f"  [OTP] 开始轮询邮箱后端({provider}) target={email} "
-            f"mailbox_id={self._mailbox_id} timeout={self.otp_timeout}s"
+            f"mailbox_id={self._mailbox_id} timeout={self.otp_timeout}s "
+            f"ignore_email_ids={ignored_ids} ignore_codes={ignored_codes}"
         )
+        if initial_delay > 0:
+            self.p(f"  [OTP] 先等待 {initial_delay:.1f}s,给新 OTP 邮件一点到达时间")
+            time.sleep(initial_delay)
         t0 = time.time()
         try:
             code = self.mail_client.wait_for_otp(
@@ -517,6 +537,8 @@ class Flow:
                 timeout=self.otp_timeout,
                 sender_keyword="openai",
                 account_id=self._mailbox_id,
+                ignore_email_ids=ignore_email_ids,
+                ignore_codes=ignore_codes,
             )
         except TimeoutError as exc:
             elapsed = time.time() - t0
@@ -534,6 +556,26 @@ class Flow:
         self.p(f"  [OTP] ✓ {elapsed:.1f}s 内拿到验证码 {code}")
         return code
 
+    def _snapshot_recent_email_ids(self, email: str, *, size: int = 10) -> set[str]:
+        if not self.mail_client:
+            return set()
+        try:
+            emails = self.mail_client.search_emails_by_recipient(
+                email, size=size, account_id=self._mailbox_id
+            )
+        except Exception as exc:
+            self.p(f"  [OTP] snapshot recent emails 失败: {exc}", "warning")
+            return set()
+        out: set[str] = set()
+        for em in emails or []:
+            eid = em.get("emailId") or em.get("id")
+            if eid is None:
+                continue
+            sid = str(eid).strip()
+            if sid:
+                out.add(sid)
+        return out
+
     def _client_auth_session_dump(self, referer: str | None = None) -> dict[str, Any]:
         """GET /api/accounts/client_auth_session_dump — browser calls this
         between OAuth steps to advance server-side state machine.
@@ -549,6 +591,7 @@ class Flow:
             headers={
                 "Accept": "application/json",
                 "Referer": referer or getattr(self.page, "url", "") or f"{OAUTH_ISSUER}/log-in",
+                **self._same_origin_fetch_headers(),
                 **self._std(),
             },
             max_redirects=0,
@@ -1356,6 +1399,7 @@ class Flow:
             "codex_cli_simplified_flow": "true",
         }
         authorize_url = f"{OAUTH_ISSUER}/oauth/authorize?{urlencode(params)}"
+        current_auth_referer = f"{OAUTH_ISSUER}/log-in"
 
         # 1/8 GET /oauth/authorize → seeds login_session cookie
         r0 = self._api_call(
@@ -1421,11 +1465,12 @@ class Flow:
         page_type = str(((data.get("page") or {}).get("type")) or "")
         self.p(f"[OAuth] step 2/8 ← page_type={page_type!r} next={next_url[:120]}")
 
-        # Browser-emulated state advance — auth.har shows /client_auth_session_dump
-        # called between every POST step. Skipping it leaves the server-side
-        # state machine on the previous step, causing 409 invalid_state when
-        # we POST the next thing.
-        self._client_auth_session_dump(referer=self._abs_auth_url(next_url) or final0)
+        current_auth_referer = self._abs_auth_url(final0) or current_auth_referer
+
+        # auth.har shows this dump using the page we are currently standing on
+        # (/log-in here), not the next continue_url. Advancing the referer one
+        # step too early makes the flow look less browser-like.
+        self._client_auth_session_dump(referer=current_auth_referer)
 
         # add-phone gate check after step 2
         if "add_phone" in page_type or "add-phone" in next_url or "add_phone" in next_url:
@@ -1445,7 +1490,8 @@ class Flow:
         )
         if need_password:
             self.p("[OAuth] step 3/8 — POST /api/accounts/password/verify (page 要求 password)")
-            headers = self._json_headers(f"{OAUTH_ISSUER}/log-in/password", OAUTH_ISSUER)
+            password_page = self._abs_auth_url(next_url) or f"{OAUTH_ISSUER}/log-in/password"
+            headers = self._json_headers(password_page, OAUTH_ISSUER)
             token = self._resolve_sentinel_token("password_verify")
             if token:
                 headers["openai-sentinel-token"] = token
@@ -1477,9 +1523,10 @@ class Flow:
                     data2 = r2["json"] or {}
                     next_url = str(data2.get("continue_url") or next_url)
                     page_type = str(((data2.get("page") or {}).get("type")) or page_type)
-                    self._client_auth_session_dump(referer=self._abs_auth_url(next_url))
+                    self._client_auth_session_dump(referer=current_auth_referer)
+                    password_page = self._abs_auth_url(next_url) or password_page
                     # retry password
-                    headers = self._json_headers(f"{OAUTH_ISSUER}/log-in/password", OAUTH_ISSUER)
+                    headers = self._json_headers(password_page, OAUTH_ISSUER)
                     token = self._resolve_sentinel_token("password_verify")
                     if token:
                         headers["openai-sentinel-token"] = token
@@ -1499,8 +1546,9 @@ class Flow:
             data = r["json"] or {}
             next_url = str(data.get("continue_url") or next_url)
             page_type = str(((data.get("page") or {}).get("type")) or page_type)
+            current_auth_referer = password_page
             self.p(f"[OAuth] step 3/8 ← page_type={page_type!r} next={next_url[:120]}")
-            self._client_auth_session_dump(referer=self._abs_auth_url(next_url))
+            self._client_auth_session_dump(referer=current_auth_referer)
             if "add_phone" in page_type or "add-phone" in next_url or "add_phone" in next_url:
                 self.oauth_fail_reason = f"add_phone_required — step3 要求绑手机 (page_type={page_type!r})"
                 self.p(f"[OAuth] ⚠ {self.oauth_fail_reason}", "warning")
@@ -1515,23 +1563,39 @@ class Flow:
         need_otp = page_type == "email_otp_verification" or "email-verification" in next_url or "email-otp" in next_url
         if need_otp:
             self.last_otp_url = self._abs_auth_url(next_url or f"{OAUTH_ISSUER}/email-verification")
+            current_auth_referer = self.last_otp_url
             self.p(f"[OAuth] step 4/8 — OAuth 阶段需要二次 OTP @ {self.last_otp_url}")
             ok = False
             last_status = 0
+            ignore_email_ids = self._snapshot_recent_email_ids(email, size=12)
+            ignore_codes: set[str] = set()
+            soft_retry_used = False
+            wait_before_fetch = 3.0
             for i in range(3):
                 self.p(f"[OAuth]   OTP try {i+1}/3 — 等邮件...")
-                code = self._wait_otp(email)
+                code = self._wait_otp(
+                    email,
+                    initial_delay=wait_before_fetch,
+                    ignore_email_ids=ignore_email_ids,
+                    ignore_codes=ignore_codes,
+                )
                 self.p(f"[OAuth]   提交 code={code}")
                 r = self._oauth_validate_otp(code)
                 last_status = r["status"]
+                ignore_codes.add(code)
+                ignore_email_ids.update(self._snapshot_recent_email_ids(email, size=12))
+                if r["status"] == 401 and not soft_retry_used:
+                    soft_retry_used = True
+                    self.p("[OAuth]   ✗ OTP 401; 先不重发,等 3s 再抓一次新码", "warning")
+                    continue
                 if r["status"] == 200:
                     data = r["json"] or {}
                     next_url = str(data.get("continue_url") or next_url)
                     page_type = str(((data.get("page") or {}).get("type")) or page_type)
-                    self.last_otp_url = self._abs_auth_url(next_url or self.last_otp_url)
                     self.p(f"[OAuth]   ✓ OTP 通过, page_type={page_type!r} next={next_url[:120]}")
-                    # auth.har: GET /client_auth_session_dump after OTP validate
-                    self._client_auth_session_dump(referer=self.last_otp_url)
+                    # auth.har uses the current OTP page as the dump referer,
+                    # then navigates onward to consent.
+                    self._client_auth_session_dump(referer=current_auth_referer)
                     if "add_phone" in page_type or "add-phone" in next_url or "add_phone" in next_url:
                         self.oauth_fail_reason = f"add_phone_required — OTP 后要求绑手机 (page_type={page_type!r})"
                         self.p(f"[OAuth] ⚠ {self.oauth_fail_reason}", "warning")
@@ -1553,10 +1617,8 @@ class Flow:
         consent_url = next_url
         if consent_url.startswith("/"):
             consent_url = f"{OAUTH_ISSUER}{consent_url}"
+        consent_referer = current_auth_referer or f"{OAUTH_ISSUER}/log-in/password"
         code = _extract_code(consent_url) if consent_url else None
-
-        if not code and consent_url:
-            code, _ = self._follow_for_code(consent_url, referer=f"{OAUTH_ISSUER}/log-in/password")
 
         consent_hint = (
             ("consent" in (consent_url or ""))
@@ -1566,9 +1628,9 @@ class Flow:
             or ("organization" in page_type)
         )
         if not code and consent_hint:
-            code = self._resolve_code_from_consent(consent_url, referer=f"{OAUTH_ISSUER}/log-in/password")
+            code = self._resolve_code_from_consent(consent_url, referer=consent_referer)
         if not code:
-            code = self._resolve_code_from_consent("", referer=f"{OAUTH_ISSUER}/log-in/password")
+            code = self._resolve_code_from_consent("", referer=consent_referer)
         if not code:
             self.oauth_fail_reason = (
                 "consent 后没拿到 authorization code — 可能是 workspace[] 里没 personal "

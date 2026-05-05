@@ -240,6 +240,8 @@ class MailProvider(ABC):
         timeout: int | None = None,
         sender_keyword: str | None = "openai",
         account_id: int | str | None = None,
+        ignore_email_ids: set[str] | None = None,
+        ignore_codes: set[str] | None = None,
     ) -> str:
         """Wait for an OTP-bearing email and return the 6-digit code.
 
@@ -251,6 +253,8 @@ class MailProvider(ABC):
         t0 = time.time()
         deadline = t0 + timeout
         seen_ids: set = set()
+        ignore_email_ids = {str(x) for x in (ignore_email_ids or set()) if x}
+        ignore_codes = {str(x) for x in (ignore_codes or set()) if x}
         seen_senders: list[str] = []
         emails_total = 0
         regex_misses = 0
@@ -265,6 +269,9 @@ class MailProvider(ABC):
                 emails = []
             for em in emails:
                 eid = em.get("emailId") or em.get("id")
+                eid_str = str(eid) if eid is not None else ""
+                if eid_str and eid_str in ignore_email_ids:
+                    continue
                 if eid in seen_ids:
                     continue
                 seen_ids.add(eid)
@@ -275,6 +282,8 @@ class MailProvider(ABC):
                 if sender_keyword and sender_keyword.lower() not in sender:
                     continue
                 code = extract_otp_from_email(em)
+                if code and code in ignore_codes:
+                    continue
                 if code:
                     logger.info("[%s] OTP 命中 (poll #%d, %.1fs): %s from %s",
                                 self.provider_name, polls, time.time() - t0, code, sender)

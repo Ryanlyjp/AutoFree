@@ -220,7 +220,15 @@ class TempmailClient(MailProvider):
 
     # ---- fast OTP path: tempmail does server-side extraction
 
-    def wait_for_otp(self, to_email, timeout=None, sender_keyword="openai", account_id=None):
+    def wait_for_otp(
+        self,
+        to_email,
+        timeout=None,
+        sender_keyword="openai",
+        account_id=None,
+        ignore_email_ids: set[str] | None = None,
+        ignore_codes: set[str] | None = None,
+    ):
         """Server-side OTP fast path.
 
         Polls `/api/mailboxes/:id/otp/latest` until it returns a code that
@@ -239,7 +247,27 @@ class TempmailClient(MailProvider):
         real_id = self._resolve_id(account_id) if account_id else self._resolve_id(to_email)
         if not real_id:
             logger.warning("[tempmail] wait_for_otp: 找不到 mailbox id for %s, 走 base.search 路径", to_email)
-            return super().wait_for_otp(to_email, timeout=timeout, sender_keyword=sender_keyword, account_id=account_id)
+            return super().wait_for_otp(
+                to_email,
+                timeout=timeout,
+                sender_keyword=sender_keyword,
+                account_id=account_id,
+                ignore_email_ids=ignore_email_ids,
+                ignore_codes=ignore_codes,
+            )
+
+        # When caller wants to ignore previously seen mailbox items/codes,
+        # the generic search path is safer than otp/latest because otp/latest
+        # may keep returning the stale "latest" code until the new email lands.
+        if ignore_email_ids or ignore_codes:
+            return super().wait_for_otp(
+                to_email,
+                timeout=timeout,
+                sender_keyword=sender_keyword,
+                account_id=real_id,
+                ignore_email_ids=ignore_email_ids,
+                ignore_codes=ignore_codes,
+            )
 
         t0 = time.time()
         deadline = t0 + timeout

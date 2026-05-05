@@ -14,7 +14,11 @@ chmod -R 700 /app/data || true
 # 3. Quick fail-fast: generate API key if .env is missing.
 if [ ! -f /app/data/.env ]; then
     echo "[entrypoint] /app/data/.env missing — generating with random key" >&2
-    KEY="$(head -c 16 /dev/urandom | xxd -p)"
+    KEY="$(python - <<'PY'
+import secrets
+print(secrets.token_hex(16))
+PY
+)"
     echo "AUTOFREE_API_KEY=${KEY}" > /app/data/.env
     echo "[entrypoint] AUTOFREE_API_KEY=${KEY}" >&2
 fi
