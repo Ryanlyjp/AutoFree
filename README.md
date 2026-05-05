@@ -16,15 +16,15 @@
 
 ## 项目概览
 
-AutoFree 面向本地实验、自动化验证和 CTF/研究场景，核心目标是：
+核心目标：
 
 1. 使用母号完成 Team 侧的注册与编排。
 2. 为新号执行 OAuth 流程并固定选择 personal workspace。
-3. 落盘生成可复用的 `auth.json`。
+3. 获取 `auth.json`。
 4. 按需将 `auth.json` 推送到 CLIProxyAPI。
 
 产物默认保存在 `data/auths/`，运行过程和日志保存在 `data/runs/`。
-
+/docs文件夹下有更详细项目说明
 ---
 
 ## 当前功能
@@ -197,12 +197,13 @@ http://host.docker.internal:7890
 3. `account_id`
 4. 可选 `email`
 
-建议从浏览器抓母号真实登录态：
+建议从浏览器抓母号真实登录态(F12)：
 
 1. 在 `chatgpt.com` 登录母号。
-2. 从 Cookie 中提取 `__Secure-next-auth.session-token`。
-3. 从 `/api/auth/session` 响应中提取 `accessToken`。
-4. 从 `/api/auth/session` 或请求头中提取 `default_workspace_id/chatgpt-account-id`。
+2. 从Application - Cookie 中提取 `__Secure-next-auth.session-token`以及`account_id`。
+3. 从Network - 任意请求中的Request headers下的Authorization中提取 `accessToken` (Bearer之后的内容，ey开头)。
+
+未加入原项目的playwright登陆，因为懒。
 
 ### 5. 可选配置 CLIProxyAPI
 
