@@ -334,6 +334,16 @@ def runs_cancel(run_id: str) -> dict[str, Any]:
     return {"ok": cancelled, "running": runner.is_running(run_id)}
 
 
+@app.delete("/api/runs/{run_id}", dependencies=[Depends(require_api_key)])
+def runs_delete(run_id: str) -> dict[str, Any]:
+    if runner.is_running(run_id):
+        raise HTTPException(status_code=409, detail="run 仍在运行中，请先 cancel 再删除")
+    ok = storage.delete_run(run_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"run {run_id} not found")
+    return {"ok": True}
+
+
 class KickCohortReq(BaseModel):
     emails: list[str] | None = None  # None → kick all un-kicked members
 
@@ -408,6 +418,25 @@ def auths_delete(email: str) -> dict[str, Any]:
     if not ok:
         raise HTTPException(status_code=404, detail=f"auth {email} not found")
     return {"ok": True}
+
+
+class DeleteAuthsReq(BaseModel):
+    emails: list[str] | None = None  # None → delete all pushed
+    pushed_only: bool = False        # True → 仅删除有 pushed_to_cpa_at 的
+
+
+@app.post("/api/auths/delete-batch", dependencies=[Depends(require_api_key)])
+def auths_delete_batch(req: DeleteAuthsReq) -> dict[str, Any]:
+    if req.emails is not None:
+        targets = list(req.emails)
+    else:
+        rows = storage.list_auths()
+        if req.pushed_only:
+            targets = [r["email"] for r in rows if r.get("pushed_to_cpa_at")]
+        else:
+            targets = [r["email"] for r in rows]
+    deleted = sum(1 for e in targets if storage.delete_auth(e))
+    return {"deleted": deleted, "total": len(targets)}
 
 
 @app.post("/api/auths/{email}/push", dependencies=[Depends(require_api_key)])

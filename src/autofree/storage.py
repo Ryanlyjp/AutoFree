@@ -187,6 +187,15 @@ def update_cohort_member(run_id: str, email: str, fields: dict | None = None, /,
         _write_run(rec)
 
 
+def delete_run(run_id: str) -> bool:
+    path = run_path(run_id)
+    with _LOCK:
+        if path.is_file():
+            path.unlink()
+            return True
+    return False
+
+
 def get_run(run_id: str) -> dict[str, Any] | None:
     with _LOCK:
         return _read_run(run_id)

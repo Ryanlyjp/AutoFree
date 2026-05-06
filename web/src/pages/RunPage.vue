@@ -86,6 +86,25 @@ async function cancel(id) {
   }
 }
 
+async function deleteRun(id) {
+  try {
+    await api.runsDelete(id);
+    if (focused.value?.id === id) focused.value = null;
+    await refreshRuns();
+  } catch (e) {
+    error.value = e.message;
+  }
+}
+
+async function clearFinished() {
+  const done = runs.value.filter(r => ["done", "done_with_errors", "failed", "cancelled"].includes(r.status));
+  if (!done.length) { error.value = "没有已完成的记录"; return; }
+  if (!confirm(`删除 ${done.length} 条已完成的运行记录?`)) return;
+  for (const r of done) await api.runsDelete(r.id).catch(() => {});
+  if (focused.value && done.some(r => r.id === focused.value?.id)) focused.value = null;
+  await refreshRuns();
+}
+
 // ---- kick cohort ----
 const kicking = ref(false);
 const kickingEmail = ref("");  // email being kicked individually
@@ -223,23 +242,33 @@ onBeforeUnmount(() => {
     <div class="grid grid-cols-3 gap-5">
       <!-- runs list -->
       <section class="card col-span-1 space-y-2">
-        <header class="flex items-center justify-between">
+        <header class="flex items-center justify-between gap-2">
           <h3 class="text-sm font-semibold">历史</h3>
-          <button class="btn-secondary text-xs px-2 py-1" @click="refreshRuns">刷新</button>
+          <div class="flex gap-1.5 ml-auto">
+            <button class="btn-secondary text-xs px-2 py-1" @click="clearFinished" title="删除所有已完成/失败/取消的记录">清除已完成</button>
+            <button class="btn-secondary text-xs px-2 py-1" @click="refreshRuns">刷新</button>
+          </div>
         </header>
         <ul class="space-y-1 max-h-[60vh] overflow-y-auto pr-1">
           <li
             v-for="r in runs"
             :key="r.id"
-            class="text-xs px-2 py-1.5 rounded cursor-pointer border"
+            class="text-xs px-2 py-1.5 rounded border group relative"
             :class="focused?.id === r.id ? 'border-indigo-500 bg-indigo-50' : 'border-slate-200 hover:bg-slate-50'"
-            @click="inspect(r.id)"
           >
-            <div class="flex justify-between">
+            <div class="flex justify-between items-center cursor-pointer" @click="inspect(r.id)">
               <span class="font-mono">{{ r.id }}</span>
-              <span class="tag-neutral">{{ r.status }}</span>
+              <div class="flex items-center gap-1">
+                <span class="tag-neutral">{{ r.status }}</span>
+                <button
+                  v-if="!['running','pending'].includes(r.status)"
+                  class="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-rose-500 leading-none px-0.5 transition-opacity"
+                  title="删除此记录"
+                  @click.stop="deleteRun(r.id)"
+                >×</button>
+              </div>
             </div>
-            <div class="text-slate-500 mt-0.5">
+            <div class="text-slate-500 mt-0.5 cursor-pointer" @click="inspect(r.id)">
               R{{ r.current_round }}/{{ r.rounds }} · per={{ r.per_round }} · {{ (r.created_at||'').slice(0,19) }}
             </div>
           </li>

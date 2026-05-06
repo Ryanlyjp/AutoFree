@@ -58,11 +58,13 @@ export const api = {
   runsStart: (payload) => request("POST", "/api/runs", payload),
   runsGet: (id) => request("GET", `/api/runs/${id}`),
   runsCancel: (id) => request("POST", `/api/runs/${id}/cancel`),
+  runsDelete: (id) => request("DELETE", `/api/runs/${id}`),
   runsKickCohort: (id, emails) => request("POST", `/api/runs/${id}/kick-cohort`, { emails: emails ?? null }),
 
   authsList: () => request("GET", "/api/auths"),
   authsGet: (email) => request("GET", `/api/auths/${encodeURIComponent(email)}`),
   authsDelete: (email) => request("DELETE", `/api/auths/${encodeURIComponent(email)}`),
+  authsDeleteBatch: (payload) => request("POST", "/api/auths/delete-batch", payload),
   authPushOne: (email, force) => request("POST", `/api/auths/${encodeURIComponent(email)}/push`, { force: !!force }),
   authPushAll: (payload) => request("POST", "/api/auths/push-all", payload || {}),
 };

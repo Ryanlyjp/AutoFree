@@ -103,6 +103,37 @@ async function del(email) {
   }
 }
 
+async function deleteSelected() {
+  if (!selected.value.size) { error.value = "未选择"; return; }
+  if (!confirm(`删除本地 ${selected.value.size} 条 auth.json? CPA 上的不会变。`)) return;
+  try {
+    const res = await api.authsDeleteBatch({ emails: [...selected.value] });
+    success.value = `已删除 ${res.deleted} 条`;
+    setTimeout(() => (success.value = ""), 3000);
+    selected.value = new Set();
+    if (detail.value && [...selected.value].includes(detail.value.email)) detail.value = null;
+    await load();
+  } catch (e) {
+    error.value = e.message;
+  }
+}
+
+async function deletePushed() {
+  const pushed = auths.value.filter(a => a.pushed_to_cpa_at);
+  if (!pushed.length) { error.value = "没有已推送的记录"; return; }
+  if (!confirm(`删除 ${pushed.length} 条已推送到 CPA 的本地 auth.json? CPA 上的不会变。`)) return;
+  try {
+    const res = await api.authsDeleteBatch({ pushed_only: true });
+    success.value = `已删除 ${res.deleted} 条`;
+    setTimeout(() => (success.value = ""), 3000);
+    selected.value = new Set();
+    if (detail.value?.pushed_to_cpa_at) detail.value = null;
+    await load();
+  } catch (e) {
+    error.value = e.message;
+  }
+}
+
 onMounted(load);
 </script>
 
@@ -125,14 +156,17 @@ onMounted(load);
       <div v-if="error" class="text-rose-600 text-xs">{{ error }}</div>
       <div v-if="success" class="text-emerald-600 text-xs">{{ success }}</div>
 
-      <div class="flex items-center gap-2 text-xs">
+      <div class="flex items-center gap-2 text-xs flex-wrap">
         <button class="btn-secondary" @click="toggleAll">
           {{ selected.size === filtered.length && filtered.length ? '取消全选' : '全选' }}
         </button>
         <span class="tag-neutral">已选 {{ selected.size }}</span>
         <button class="btn-primary" :disabled="!selected.size" @click="pushSelected(false)">推送选中 → CPA</button>
         <button class="btn-secondary" :disabled="!selected.size" @click="pushSelected(true)" title="覆盖 CPA 上的同名文件">推送 (force)</button>
-        <button class="btn-secondary ml-auto" @click="pushAllUnpushed">一键推送未推送</button>
+        <button class="btn-danger" :disabled="!selected.size" @click="deleteSelected">删除选中</button>
+        <span class="flex-1"></span>
+        <button class="btn-secondary" @click="pushAllUnpushed">一键推送未推送</button>
+        <button class="btn-danger" @click="deletePushed" title="删除所有已推送到 CPA 的本地文件">删除已推送</button>
       </div>
 
       <div class="border rounded text-xs overflow-x-auto">
