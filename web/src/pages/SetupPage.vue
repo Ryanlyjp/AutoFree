@@ -38,11 +38,20 @@ async function patch(payload) {
 // ---- proxy ----
 
 const proxyForm = reactive({ value: "" });
+const proxyProbe = ref(null);
 function loadProxyFromSettings() {
   proxyForm.value = settings.value?.proxy || "";
 }
 async function saveProxy() {
   await patch({ proxy: proxyForm.value });
+}
+async function probeProxy() {
+  proxyProbe.value = { running: true };
+  try {
+    proxyProbe.value = await api.proxyProbe();
+  } catch (e) {
+    proxyProbe.value = { ok: false, error: e.message };
+  }
 }
 
 // ---- mail ----
@@ -238,21 +247,24 @@ onMounted(async () => {
         <h2 class="text-base font-semibold">代理</h2>
         <span class="text-xs text-slate-500">浏览器和后端请求都会走此代理。留空 = 不使用</span>
       </header>
-      <div class="grid grid-cols-3 gap-3">
-        <div class="col-span-2">
-          <label class="label">Proxy URL</label>
-          <input v-model="proxyForm.value" class="input" placeholder="socks5://127.0.0.1:1080" />
-          <p class="mt-2 text-xs text-slate-500">
-            格式说明：填写一个完整 URL，不是 <code>IP,PORT,USER,PWD</code>。
-            例如 <code>http://127.0.0.1:7890</code>、
-            <code>socks5://127.0.0.1:1080</code>、
-            <code>socks5://user:pass@127.0.0.1:1080</code>。
-          </p>
-        </div>
-        <div class="self-end">
-          <button class="btn-primary w-full" @click="saveProxy">保存</button>
-        </div>
+      <div>
+        <label class="label">Proxy URL</label>
+        <input v-model="proxyForm.value" class="input" placeholder="socks5://127.0.0.1:1080" />
+        <p class="mt-2 text-xs text-slate-500">
+          格式说明：填写一个完整 URL，不是 <code>IP,PORT,USER,PWD</code>。
+          例如 <code>http://127.0.0.1:7890</code>、
+          <code>socks5://127.0.0.1:1080</code>、
+          <code>socks5://user:pass@127.0.0.1:1080</code>。
+        </p>
       </div>
+      <div class="flex items-center gap-3">
+        <button class="btn-primary" @click="saveProxy">保存</button>
+        <button class="btn-secondary" @click="probeProxy">测试连通</button>
+        <span v-if="proxyProbe?.running" class="text-xs text-slate-500">probing...</span>
+        <span v-else-if="proxyProbe?.ok" class="tag-ok">OK · {{ proxyProbe.latency_ms }}ms (HTTP {{ proxyProbe.status }})</span>
+        <span v-else-if="proxyProbe" class="tag-err" :title="proxyProbe.error">FAIL</span>
+      </div>
+      <p v-if="proxyProbe && !proxyProbe.ok && proxyProbe.error" class="text-xs text-rose-600">{{ proxyProbe.error }}</p>
     </section>
 
     <!-- mail -->

@@ -197,8 +197,14 @@ onMounted(load);
                 <span v-else class="tag-warn">未推送</span>
               </td>
               <td class="px-2 py-1">
-                <button class="btn-secondary text-xs px-2 py-0.5" @click="pushOne(a.email, false)">push</button>
-                <button class="btn-danger text-xs px-2 py-0.5 ml-1" @click="del(a.email)">del</button>
+                <div class="flex items-center gap-1">
+                  <button class="btn-secondary text-xs px-2 py-0.5" @click="pushOne(a.email, false)">push</button>
+                  <button class="btn-danger text-xs px-1.5 py-0.5 leading-none" title="删除" @click="del(a.email)">
+                    <svg class="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
+                      <path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd" />
+                    </svg>
+                  </button>
+                </div>
               </td>
             </tr>
             <tr v-if="!filtered.length"><td colspan="6" class="px-2 py-3 text-center text-slate-400">无</td></tr>

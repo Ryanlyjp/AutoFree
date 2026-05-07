@@ -158,6 +158,26 @@ function stageIdx(label) {
   return stages.indexOf(label);
 }
 
+function runLabel(r) {
+  const total = (r.rounds || 1) * (r.per_round || 1);
+  if (r.status === "done" || r.status === "done_with_errors") {
+    const ok = r.summary?.ok ?? 0;
+    return `${ok}/${total} 成功`;
+  }
+  if (r.status === "register_only_done") {
+    const reg = r.summary?.registered ?? 0;
+    return `${reg}/${total} 注册`;
+  }
+  return r.status;
+}
+
+function runTagClass(r) {
+  if (r.status === "done") return "tag-ok";
+  if (r.status === "done_with_errors") return "tag-warn";
+  if (r.status === "failed") return "tag-err";
+  return "tag-neutral";
+}
+
 const masterReady = computed(() => props.master?.has_session_token && props.master?.account_id);
 
 watch(
@@ -259,7 +279,7 @@ onBeforeUnmount(() => {
             <div class="flex justify-between items-center cursor-pointer" @click="inspect(r.id)">
               <span class="font-mono">{{ r.id }}</span>
               <div class="flex items-center gap-1">
-                <span class="tag-neutral">{{ r.status }}</span>
+                <span :class="runTagClass(r)">{{ runLabel(r) }}</span>
                 <button
                   v-if="!['running','pending'].includes(r.status)"
                   class="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-rose-500 leading-none px-0.5 transition-opacity"
@@ -281,7 +301,7 @@ onBeforeUnmount(() => {
         <header class="flex items-center gap-3 flex-wrap">
           <h3 class="text-sm font-semibold">详情</h3>
           <span v-if="focused" class="text-xs text-slate-500 font-mono">{{ focused.id }}</span>
-          <span v-if="focused" class="tag-neutral">{{ focused.status }}</span>
+          <span v-if="focused" :class="runTagClass(focused)">{{ runLabel(focused) }}</span>
           <div class="ml-auto flex items-center gap-2">
             <button
               v-if="focused && ['running','pending'].includes(focused.status)"

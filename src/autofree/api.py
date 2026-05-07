@@ -5,6 +5,7 @@ Endpoints fall into 6 groups, all under /api/* unless noted:
   /api/settings (GET/PATCH)       proxy / mail / cpa config (deep-merged)
   /api/mail/probe                 verify mail backend connectivity
   /api/cpa/probe                  verify CPA reachability
+  /api/proxy/probe                verify proxy connectivity (GET chatgpt.com through proxy)
   /api/master/*                   session import + auto_provision + members + kick
   /api/runs (CRUD)                start / list / inspect / cancel a multi-round run
   /api/auths (CRUD + push)        list / push / delete saved free-account tokens
@@ -15,8 +16,11 @@ Static files served at /  ← src/autofree/web/dist (Vue build output).
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Any
+
+import requests as requests_lib
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,7 +31,7 @@ from pydantic import BaseModel, Field
 from autofree import admin_state, cpa_push, master, runner, storage
 from autofree.config import get_api_key
 from autofree.mail import get_mail_client
-from autofree.proxy import ProxyConfigError, normalize_proxy_url
+from autofree.proxy import ProxyConfigError, build_requests_proxy_map, normalize_proxy_url
 from autofree.settings import get_all as settings_get_all
 from autofree.settings import update as settings_update
 
@@ -156,6 +160,26 @@ def mail_probe(req: MailProbeReq) -> dict[str, Any]:
 def cpa_probe() -> dict[str, Any]:
     try:
         return cpa_push.probe()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@app.post("/api/proxy/probe", dependencies=[Depends(require_api_key)])
+def proxy_probe() -> dict[str, Any]:
+    raw = (settings_get_all().get("proxy") or "").strip()
+    if not raw:
+        return {"ok": False, "error": "未配置代理"}
+    try:
+        proxies = build_requests_proxy_map(raw)
+        t0 = time.monotonic()
+        resp = requests_lib.get(
+            "https://chatgpt.com",
+            proxies=proxies,
+            timeout=10,
+            allow_redirects=False,
+        )
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        return {"ok": True, "status": resp.status_code, "latency_ms": latency_ms}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
