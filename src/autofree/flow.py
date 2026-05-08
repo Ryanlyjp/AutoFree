@@ -834,6 +834,7 @@ class Flow:
         so = self._resolve_sentinel_so_token("oauth_create_account")
         if so:
             headers["openai-sentinel-so-token"] = so
+
         r = self._api_call(
             "post",
             f"{AUTH}/api/accounts/create_account",
@@ -842,6 +843,7 @@ class Flow:
             headers=headers,
         )
         data = r["json"] or {"text": (r["text"] or "")[:300]}
+        self.p(f"[create-account] resp: {json.dumps(data)[:200]}")
         if isinstance(data, dict):
             self.callback_url = data.get("continue_url") or data.get("url") or data.get("redirect_url") or ""
         return r["status"], data
@@ -922,7 +924,7 @@ class Flow:
             if not ok:
                 raise FlowError(f"register OTP validate failed: {last}")
 
-        self.p("[register] step 7/7 — POST /api/accounts/create_account (生日 + 姓名)")
+        self.p("[register] step 7/7 — POST /api/accounts/create_account (年龄 + 姓名)")
         status, data = self._create_account(name, birthdate)
         if status != 200:
             self.p(f"[register] ✗ create_account HTTP {status}: {data}", "error")
