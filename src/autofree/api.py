@@ -322,6 +322,7 @@ class StartRunReq(BaseModel):
     per_round: int = Field(..., ge=1, le=10)
     mail_provider: str | None = None
     register_only: bool = False
+    auto_push_cpa: bool = False
 
 
 @app.get("/api/runs", dependencies=[Depends(require_api_key)])
@@ -336,7 +337,13 @@ def runs_start(req: StartRunReq) -> dict[str, Any]:
     if not admin_state.get_account_id():
         raise HTTPException(status_code=400, detail="母号 account_id 未设置")
     try:
-        record = runner.start_run(req.rounds, req.per_round, mail_provider=req.mail_provider, register_only=req.register_only)
+        record = runner.start_run(
+            req.rounds,
+            req.per_round,
+            mail_provider=req.mail_provider,
+            register_only=req.register_only,
+            auto_push_cpa=req.auto_push_cpa,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return record

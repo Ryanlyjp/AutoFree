@@ -125,9 +125,14 @@ cpa_push.push_one()
 
 CTF 比赛环境经常要换代理 / 换邮箱后端 / 换母号；如果每次改 .env 都要重启 + 丢任务进度，不可接受。`settings.json` + Web UI 可以热改，下一次任务读到新值。
 
-### 2. 为什么 CPA push 不自动
+### 2. 为什么 CPA push 默认不自动
 
-OAuth 出错的概率不低 (Cloudflare、OTP 慢、workspace 漂移)。如果失败的 auth 也被自动推到 CPA，会污染 CPA 的可用文件池。改成「落盘 + 用户手动推」让人能 review 再决定。
+OAuth 出错的概率不低 (Cloudflare、OTP 慢、workspace 漂移)。如果把自动推送做成默认行为，失败批次很容易把 CPA 池子污染掉。所以现在的策略是：
+
+- 默认仍然是「落盘 + 用户手动推」
+- Run 页可以显式勾选「结束后自动推送到 CPA」
+- 勾选后也只推本次 run 成功 OAuth 的 auth
+- 同名文件默认跳过，不覆盖
 
 文件名前缀 `codex-free-` 也是同理 — 让 CPA 上 AutoFree 产物和 AutoTeam Team 产物视觉可分。
 

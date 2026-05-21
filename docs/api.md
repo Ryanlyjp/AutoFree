@@ -232,7 +232,7 @@ curl -X POST -H "Authorization: Bearer $KEY" \
 ```bash
 curl -X POST -H "Authorization: Bearer $KEY" \
      -H "Content-Type: application/json" \
-     -d '{"rounds":2,"per_round":3}' \
+     -d '{"rounds":2,"per_round":3,"auto_push_cpa":true}' \
      http://localhost:8788/api/runs
 ```
 
@@ -243,7 +243,12 @@ curl -X POST -H "Authorization: Bearer $KEY" \
   "created_at": "2026-05-02T10:00:00+08:00",
   "rounds": 2,
   "per_round": 3,
-  "params": { "mail_provider": "", "proxy": "http://127.0.0.1:7890" },
+  "params": {
+    "mail_provider": "",
+    "proxy": "http://127.0.0.1:7890",
+    "register_only": false,
+    "auto_push_cpa": true
+  },
   "current_round": 0,
   "current_stage": "",
   "logs": [],
@@ -252,6 +257,13 @@ curl -X POST -H "Authorization: Bearer $KEY" \
   "error": ""
 }
 ```
+
+可选字段：
+
+- `register_only: true` → 只注册，不做 OAuth / kick / CPA 推送
+- `auto_push_cpa: true` → run 结束后自动把本次 run 成功 OAuth 的 auth 推到 CPA
+
+`auto_push_cpa=true` 只会推送本次 run 新产出的 auth，不会扫描历史 auth，也不会覆盖 CPA 上已有同名文件；若 `CPA base_url / key` 未配置，启动时直接返回 400。
 
 校验失败 (rounds < 1, per_round > 10, 母号 token 缺失) 返回 400。
 
@@ -289,7 +301,19 @@ curl -H "Authorization: Bearer $KEY" "http://localhost:8788/api/runs?limit=20"
 
 `status` 取值：`pending` → `running` → `done` / `done_with_errors` / `failed` / `cancelled`。
 
-`current_stage`：`init` / `auto_provision_off` / `register` / `auto_provision_on` / `oauth` / `kick` / `done`.
+`current_stage`：`init` / `auto_provision_off` / `register` / `auto_provision_on` / `oauth` / `kick` / `cpa_push` / `done`。
+
+如果开启 `auto_push_cpa`，完成后 `summary.cpa` 里会额外返回：
+
+```json
+{
+  "enabled": true,
+  "attempted": 3,
+  "pushed": 2,
+  "skipped": 1,
+  "failed": 0
+}
+```
 
 ### `POST /api/runs/{run_id}/cancel`
 

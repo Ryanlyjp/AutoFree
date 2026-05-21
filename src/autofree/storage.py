@@ -217,6 +217,7 @@ def list_runs(limit: int = 50) -> list[dict[str, Any]]:
                 "finished_at": rec.get("finished_at"),
                 "rounds": rec.get("rounds"),
                 "per_round": rec.get("per_round"),
+                "params": rec.get("params") or {},
                 "current_round": rec.get("current_round"),
                 "current_stage": rec.get("current_stage"),
                 "summary": rec.get("summary"),

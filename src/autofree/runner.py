@@ -36,7 +36,7 @@ from typing import Any, Callable
 from autofree import cpa_push, master, storage
 from autofree.config import AP_PROPAGATION_DELAY
 from autofree.mail import get_mail_client
-from autofree.settings import get_proxy
+from autofree.settings import get_cpa_config, get_proxy
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,7 @@ STAGE_REGISTER = "register"
 STAGE_AP_ON = "auto_provision_on"
 STAGE_OAUTH = "oauth"
 STAGE_KICK = "kick"
+STAGE_CPA_PUSH = "cpa_push"
 STAGE_DONE = "done"
 STAGE_REGISTER_ONLY_DONE = "register_only_done"
 
@@ -144,6 +145,14 @@ def _logger_for(run_id: str) -> Callable[[str, str], None]:
     return emit
 
 
+def _ensure_cpa_ready_for_auto_push() -> None:
+    cfg = get_cpa_config()
+    base_url = (cfg.get("base_url") or "").strip()
+    key = (cfg.get("key") or "").strip()
+    if not base_url or not key:
+        raise ValueError("已勾选自动推送 CPA,但 CPA 未配置 base_url / key")
+
+
 # ============================================================ flow.py adapter
 
 
@@ -182,7 +191,15 @@ def _run_round(
 
     master_client = master.get_default_client()
 
-    summary = {"round": round_index, "n": n, "registered": 0, "oauthed": 0, "kicked": 0, "errors": []}
+    summary = {
+        "round": round_index,
+        "n": n,
+        "registered": 0,
+        "oauthed": 0,
+        "kicked": 0,
+        "errors": [],
+        "oauth_emails": [],
+    }
 
     # ---- 1. AP off ----
     storage.update_run(run_id, current_stage=STAGE_AP_OFF, current_round=round_index)
@@ -296,6 +313,7 @@ def _run_round(
             cpa_push.save_and_register(email, tokens, extra={"run_id": run_id, "round": round_index})
             member["stage"] = "oauthed"
             summary["oauthed"] += 1
+            summary["oauth_emails"].append(email)
             log(f"  ✓ OAuth + 落盘成功 {email}")
         except Exception as exc:
             member["stage"] = "oauth_failed"
@@ -345,7 +363,47 @@ def _interruptible_sleep(seconds: float, cancel: CancelSignal) -> None:
         time.sleep(min(0.5, end - time.time()))
 
 
-def _run_multi_inner(run_id: str, rounds: int, per_round: int, mail_provider: str | None, register_only: bool = False) -> None:
+def _auto_push_run_auths(run_id: str, emails: list[str]) -> dict[str, Any]:
+    log = _logger_for(run_id)
+    deduped = list(dict.fromkeys(email for email in emails if email))
+    storage.update_run(run_id, current_stage=STAGE_CPA_PUSH)
+    if not deduped:
+        log("[CPA] 已启用自动推送,但本次 run 没有可推送的 auth", "warning")
+        return {"enabled": True, "attempted": 0, "pushed": 0, "skipped": 0, "failed": 0}
+
+    log(f"[CPA] 自动推送启动: 共 {len(deduped)} 个 auth (仅本次 run 产出)")
+    result = cpa_push.push_many(deduped, overwrite=False)
+    for row in result.get("results") or []:
+        email = row.get("email") or "?"
+        if row.get("ok"):
+            log(f"[CPA] ✓ 已推送 {email}")
+        elif row.get("skipped"):
+            reason = row.get("reason") or "skipped"
+            log(f"[CPA] - 跳过 {email}: {reason}", "warning")
+        else:
+            reason = row.get("error") or row.get("reason") or "unknown error"
+            log(f"[CPA] ✗ 推送失败 {email}: {reason}", "error")
+    log(
+        f"[CPA] 自动推送结束: pushed={result.get('pushed', 0)} "
+        f"skipped={result.get('skipped', 0)} failed={result.get('failed', 0)}"
+    )
+    return {
+        "enabled": True,
+        "attempted": len(deduped),
+        "pushed": int(result.get("pushed") or 0),
+        "skipped": int(result.get("skipped") or 0),
+        "failed": int(result.get("failed") or 0),
+    }
+
+
+def _run_multi_inner(
+    run_id: str,
+    rounds: int,
+    per_round: int,
+    mail_provider: str | None,
+    register_only: bool = False,
+    auto_push_cpa: bool = False,
+) -> None:
     log = _logger_for(run_id)
     cancel = CancelSignal()
     with _CANCELS_LOCK:
@@ -353,9 +411,17 @@ def _run_multi_inner(run_id: str, rounds: int, per_round: int, mail_provider: st
 
     storage.update_run(run_id, status="running", started_at=_now_iso(), current_stage=STAGE_INIT)
     mode_label = "仅注册" if register_only else "全流程"
-    log(f"=== 任务启动: rounds={rounds} per_round={per_round} mode={mode_label} ===")
+    cpa_label = "auto-cpa=on" if auto_push_cpa else "auto-cpa=off"
+    log(f"=== 任务启动: rounds={rounds} per_round={per_round} mode={mode_label} {cpa_label} ===")
 
-    total = {"registered": 0, "oauthed": 0, "kicked": 0, "errors": []}
+    total = {
+        "registered": 0,
+        "oauthed": 0,
+        "kicked": 0,
+        "errors": [],
+        "oauth_emails": [],
+        "cpa": {"enabled": auto_push_cpa, "attempted": 0, "pushed": 0, "skipped": 0, "failed": 0},
+    }
     final_status = "done"
     fatal_error = ""
 
@@ -375,6 +441,7 @@ def _run_multi_inner(run_id: str, rounds: int, per_round: int, mail_provider: st
                 total["oauthed"] += summary["oauthed"]
                 total["kicked"] += summary["kicked"]
                 total["errors"].extend(summary["errors"])
+                total["oauth_emails"].extend(summary["oauth_emails"])
             except Exception as exc:
                 # round-level fatal — log and continue to next round unless cancelled.
                 log(f"[Round {r}] 轮级失败: {exc}", "error")
@@ -392,6 +459,34 @@ def _run_multi_inner(run_id: str, rounds: int, per_round: int, mail_provider: st
         with _CANCELS_LOCK:
             _CANCELS.pop(run_id, None)
 
+    if auto_push_cpa:
+        if register_only:
+            log("[CPA] 当前是仅注册模式,跳过自动推送", "warning")
+            total["cpa"]["skipped_reason"] = "register_only"
+        elif final_status == "cancelled":
+            log("[CPA] 任务已取消,跳过自动推送", "warning")
+            total["cpa"]["skipped_reason"] = "cancelled"
+        elif final_status == "failed":
+            log("[CPA] 任务级异常导致失败,跳过自动推送", "warning")
+            total["cpa"]["skipped_reason"] = "task_failed"
+        else:
+            try:
+                total["cpa"] = _auto_push_run_auths(run_id, total["oauth_emails"])
+            except Exception as exc:
+                total["errors"].append({"where": "cpa_push", "msg": str(exc)})
+                total["cpa"] = {
+                    "enabled": True,
+                    "attempted": len(total["oauth_emails"]),
+                    "pushed": 0,
+                    "skipped": 0,
+                    "failed": len(total["oauth_emails"]),
+                    "error": str(exc),
+                }
+                log(f"[CPA] 自动推送异常: {exc}", "error")
+
+            if total["cpa"].get("failed") and final_status == "done":
+                final_status = "done_with_errors"
+
     storage.update_run(
         run_id,
         status=final_status,
@@ -404,13 +499,21 @@ def _run_multi_inner(run_id: str, rounds: int, per_round: int, mail_provider: st
             "errors": total["errors"],
             "ok": total["oauthed"],
             "failed": len(total["errors"]),
+            "cpa": total["cpa"],
         },
         error=fatal_error,
     )
     log(f"=== 任务结束: status={final_status} 注册={total['registered']} 拿token={total['oauthed']} kick={total['kicked']} ===")
 
 
-def start_run(rounds: int, per_round: int, *, mail_provider: str | None = None, register_only: bool = False) -> dict[str, Any]:
+def start_run(
+    rounds: int,
+    per_round: int,
+    *,
+    mail_provider: str | None = None,
+    register_only: bool = False,
+    auto_push_cpa: bool = False,
+) -> dict[str, Any]:
     """Validate inputs, create the run record, kick off the worker thread.
     Returns the initial run record (with `id`)."""
     rounds = int(rounds)
@@ -419,15 +522,22 @@ def start_run(rounds: int, per_round: int, *, mail_provider: str | None = None, 
         raise ValueError("rounds 与 per_round 都必须 >= 1")
     if per_round > TEAM_HARD_CAP:
         raise ValueError(f"per_round 不能超过 {TEAM_HARD_CAP}")
+    if auto_push_cpa:
+        _ensure_cpa_ready_for_auto_push()
 
     record = storage.create_run(
         rounds=rounds,
         per_round=per_round,
-        params={"mail_provider": mail_provider or "", "proxy": get_proxy(), "register_only": register_only},
+        params={
+            "mail_provider": mail_provider or "",
+            "proxy": get_proxy(),
+            "register_only": register_only,
+            "auto_push_cpa": auto_push_cpa,
+        },
     )
     threading.Thread(
         target=_run_multi_inner,
-        args=(record["id"], rounds, per_round, mail_provider, register_only),
+        args=(record["id"], rounds, per_round, mail_provider, register_only, auto_push_cpa),
         name=f"autofree-run-{record['id']}",
         daemon=True,
     ).start()
@@ -437,13 +547,27 @@ def start_run(rounds: int, per_round: int, *, mail_provider: str | None = None, 
 # ============================================================ blocking variant (for CLI)
 
 
-def run_blocking(rounds: int, per_round: int, *, mail_provider: str | None = None) -> dict[str, Any]:
+def run_blocking(
+    rounds: int,
+    per_round: int,
+    *,
+    mail_provider: str | None = None,
+    register_only: bool = False,
+    auto_push_cpa: bool = False,
+) -> dict[str, Any]:
     """Synchronous variant for CLI use — blocks until the run finishes,
     returns the final run record."""
+    if auto_push_cpa:
+        _ensure_cpa_ready_for_auto_push()
     record = storage.create_run(
         rounds=rounds,
         per_round=per_round,
-        params={"mail_provider": mail_provider or "", "proxy": get_proxy()},
+        params={
+            "mail_provider": mail_provider or "",
+            "proxy": get_proxy(),
+            "register_only": register_only,
+            "auto_push_cpa": auto_push_cpa,
+        },
     )
-    _run_multi_inner(record["id"], rounds, per_round, mail_provider)
+    _run_multi_inner(record["id"], rounds, per_round, mail_provider, register_only, auto_push_cpa)
     return storage.get_run(record["id"]) or record

@@ -4,7 +4,7 @@ import { api } from "../api.js";
 
 const props = defineProps({ master: Object });
 
-const form = reactive({ rounds: 1, per_round: 1, mail_provider: "", register_only: false });
+const form = reactive({ rounds: 1, per_round: 1, mail_provider: "", register_only: false, auto_push_cpa: false });
 const error = ref("");
 const success = ref("");
 
@@ -55,7 +55,12 @@ async function start() {
     return;
   }
   try {
-    const payload = { rounds: Number(form.rounds), per_round: Number(form.per_round), register_only: form.register_only };
+    const payload = {
+      rounds: Number(form.rounds),
+      per_round: Number(form.per_round),
+      register_only: form.register_only,
+      auto_push_cpa: form.auto_push_cpa,
+    };
     if (form.mail_provider) payload.mail_provider = form.mail_provider;
     const rec = await api.runsStart(payload);
     success.value = `任务已启动 ${rec.id}`;
@@ -143,6 +148,15 @@ const hasUnkicked = computed(() =>
   (focused.value?.cohort || []).some(m => !m.kicked)
 );
 
+const focusedStages = computed(() => {
+  const base = ["init", "auto_provision_off", "register", "auto_provision_on"];
+  if (focused.value?.params?.register_only) return [...base, "register_only_done", "done"];
+  const tail = ["oauth", "kick"];
+  if (focused.value?.params?.auto_push_cpa) tail.push("cpa_push");
+  tail.push("done");
+  return [...base, ...tail];
+});
+
 function startPolling() {
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(async () => {
@@ -153,20 +167,19 @@ function startPolling() {
   }, 2500);
 }
 
-const stages = ["init", "auto_provision_off", "register", "auto_provision_on", "oauth", "kick", "done", "register_only_done"];
 function stageIdx(label) {
-  return stages.indexOf(label);
+  return focusedStages.value.indexOf(label);
 }
 
 function runLabel(r) {
   const total = (r.rounds || 1) * (r.per_round || 1);
+  if (r.params?.register_only && (r.status === "done" || r.status === "done_with_errors")) {
+    const reg = r.summary?.registered ?? 0;
+    return `${reg}/${total} 注册`;
+  }
   if (r.status === "done" || r.status === "done_with_errors") {
     const ok = r.summary?.ok ?? 0;
     return `${ok}/${total} 成功`;
-  }
-  if (r.status === "register_only_done") {
-    const reg = r.summary?.registered ?? 0;
-    return `${reg}/${total} 注册`;
   }
   return r.status;
 }
@@ -187,6 +200,13 @@ watch(
     if (logRef.value) {
       logRef.value.scrollTop = logRef.value.scrollHeight;
     }
+  }
+);
+
+watch(
+  () => form.register_only,
+  (value) => {
+    if (value) form.auto_push_cpa = false;
   }
 );
 
@@ -240,6 +260,20 @@ onBeforeUnmount(() => {
         <input id="register-only" v-model="form.register_only" type="checkbox" class="h-4 w-4 rounded border-slate-300" />
         <label for="register-only" class="cursor-pointer select-none">
           仅注册模式 <span class="text-slate-500 text-xs">(只走注册 + AP-on, 跳过 OAuth 和 kick, 可手动 auth)</span>
+        </label>
+      </div>
+
+      <div class="flex items-center gap-2 text-sm">
+        <input
+          id="auto-push-cpa"
+          v-model="form.auto_push_cpa"
+          type="checkbox"
+          class="h-4 w-4 rounded border-slate-300"
+          :disabled="form.register_only"
+        />
+        <label for="auto-push-cpa" class="cursor-pointer select-none" :class="form.register_only ? 'text-slate-400' : ''">
+          结束后自动推送到 CPA
+          <span class="text-slate-500 text-xs">(只推本次 run 成功 OAuth 的账号；已存在同名文件会跳过，不覆盖)</span>
         </label>
       </div>
 
@@ -328,17 +362,24 @@ onBeforeUnmount(() => {
         <div v-if="!focused" class="text-xs text-slate-500">点左侧选一条任务查看进度</div>
 
         <template v-else>
+          <div class="flex flex-wrap items-center gap-2 text-xs">
+            <span v-if="focused.params?.register_only" class="tag-neutral">模式: 仅注册</span>
+            <span v-else class="tag-neutral">模式: 全流程</span>
+            <span v-if="focused.params?.auto_push_cpa" class="tag-ok">CPA 自动推送: 开启</span>
+            <span v-else class="tag-neutral">CPA 自动推送: 关闭</span>
+          </div>
+
           <!-- stepper -->
           <div class="flex flex-wrap items-center gap-1 text-xs">
             <span
-              v-for="(s, i) in stages"
+              v-for="(s, i) in focusedStages"
               :key="s"
               class="px-2 py-1 rounded"
               :class="stageIdx(focused.current_stage) >= i ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-500'"
             >{{ s }}</span>
           </div>
 
-          <div class="grid grid-cols-3 gap-3 text-xs">
+          <div class="grid grid-cols-4 gap-3 text-xs">
             <div class="card p-3 bg-slate-50">
               <div class="text-slate-500">注册成功</div>
               <div class="text-lg font-bold">{{ focused.summary?.registered ?? 0 }}</div>
@@ -350,6 +391,18 @@ onBeforeUnmount(() => {
             <div class="card p-3 bg-slate-50">
               <div class="text-slate-500">已踢出</div>
               <div class="text-lg font-bold">{{ focused.summary?.kicked ?? (focused.cohort||[]).filter(m=>m.kicked).length }}</div>
+            </div>
+            <div class="card p-3 bg-slate-50">
+              <div class="text-slate-500">CPA 推送</div>
+              <div class="text-lg font-bold">
+                <template v-if="focused.params?.auto_push_cpa">
+                  {{ focused.summary?.cpa?.pushed ?? 0 }}/{{ focused.summary?.cpa?.attempted ?? 0 }}
+                </template>
+                <template v-else>关闭</template>
+              </div>
+              <div v-if="focused.params?.auto_push_cpa" class="mt-1 text-[11px] text-slate-500">
+                skip {{ focused.summary?.cpa?.skipped ?? 0 }} · fail {{ focused.summary?.cpa?.failed ?? 0 }}
+              </div>
             </div>
           </div>
 
