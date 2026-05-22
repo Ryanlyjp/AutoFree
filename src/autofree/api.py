@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import requests as requests_lib
 
@@ -322,7 +322,8 @@ class StartRunReq(BaseModel):
     per_round: int = Field(..., ge=1, le=10)
     mail_provider: str | None = None
     register_only: bool = False
-    auto_push_cpa: bool = False
+    auto_push_cpa: bool = True
+    kick_mode: Literal["round_end", "after_each_auth"] = runner.KICK_MODE_ROUND_END
 
 
 @app.get("/api/runs", dependencies=[Depends(require_api_key)])
@@ -343,6 +344,7 @@ def runs_start(req: StartRunReq) -> dict[str, Any]:
             mail_provider=req.mail_provider,
             register_only=req.register_only,
             auto_push_cpa=req.auto_push_cpa,
+            kick_mode=req.kick_mode,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

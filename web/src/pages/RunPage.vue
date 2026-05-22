@@ -4,7 +4,14 @@ import { api } from "../api.js";
 
 const props = defineProps({ master: Object });
 
-const form = reactive({ rounds: 1, per_round: 1, mail_provider: "", register_only: false, auto_push_cpa: false });
+const form = reactive({
+  rounds: 1,
+  per_round: 1,
+  mail_provider: "",
+  register_only: false,
+  auto_push_cpa: true,
+  kick_mode: "round_end",
+});
 const error = ref("");
 const success = ref("");
 
@@ -21,6 +28,15 @@ const cap = 10;
 const totalNew = computed(() => Number(form.rounds) * Number(form.per_round));
 const perRoundOK = computed(() =>
   memberCount.value === null ? null : Number(form.per_round) + Number(memberCount.value) <= cap
+);
+const immediateKickMode = computed(() => form.kick_mode === "after_each_auth");
+const autoPushTitle = computed(() =>
+  immediateKickMode.value ? "每个账号 kick 后自动推送到 CPA" : "结束后自动推送到 CPA"
+);
+const autoPushHint = computed(() =>
+  immediateKickMode.value
+    ? "(只推本次 run 成功 OAuth 的账号；每个账号 kick 后立刻推送，已存在同名文件会跳过，不覆盖)"
+    : "(只推本次 run 成功 OAuth 的账号；run 结束后统一推送，已存在同名文件会跳过，不覆盖)"
 );
 
 async function probe() {
@@ -60,6 +76,7 @@ async function start() {
       per_round: Number(form.per_round),
       register_only: form.register_only,
       auto_push_cpa: form.auto_push_cpa,
+      kick_mode: form.kick_mode,
     };
     if (form.mail_provider) payload.mail_provider = form.mail_provider;
     const rec = await api.runsStart(payload);
@@ -191,6 +208,10 @@ function runTagClass(r) {
   return "tag-neutral";
 }
 
+function kickModeLabel(mode) {
+  return mode === "after_each_auth" ? "逐账号即时 kick" : "统一收尾 kick";
+}
+
 const masterReady = computed(() => props.master?.has_session_token && props.master?.account_id);
 
 watch(
@@ -206,7 +227,7 @@ watch(
 watch(
   () => form.register_only,
   (value) => {
-    if (value) form.auto_push_cpa = false;
+    form.auto_push_cpa = !value;
   }
 );
 
@@ -233,16 +254,16 @@ onBeforeUnmount(() => {
         <span class="text-xs text-slate-500">N + 已有成员 ≤ 10</span>
       </header>
 
-      <div class="grid grid-cols-4 gap-3 items-end">
-        <div>
+      <div class="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
+        <div class="md:col-span-2 lg:col-span-1 max-w-[7rem]">
           <label class="label">轮数 R</label>
           <input v-model.number="form.rounds" type="number" min="1" max="20" class="input" />
         </div>
-        <div>
+        <div class="md:col-span-2 lg:col-span-1 max-w-[7rem]">
           <label class="label">每轮 N</label>
           <input v-model.number="form.per_round" type="number" min="1" :max="cap" class="input" />
         </div>
-        <div>
+        <div class="md:col-span-4 lg:col-span-4">
           <label class="label">邮箱后端 (可选覆盖)</label>
           <select v-model="form.mail_provider" class="select">
             <option value="">使用配置</option>
@@ -251,7 +272,14 @@ onBeforeUnmount(() => {
             <option value="maillab">maillab</option>
           </select>
         </div>
-        <div>
+        <div class="md:col-span-4 lg:col-span-4">
+          <label class="label">踢出方式</label>
+          <select v-model="form.kick_mode" class="select">
+            <option value="round_end">统一踢出 (现有模式)</option>
+            <option value="after_each_auth">逐账号 auth 完成立刻 kick</option>
+          </select>
+        </div>
+        <div class="md:col-span-12 lg:col-span-2">
           <button class="btn-primary w-full" :disabled="!masterReady" @click="start">启动</button>
         </div>
       </div>
@@ -272,8 +300,8 @@ onBeforeUnmount(() => {
           :disabled="form.register_only"
         />
         <label for="auto-push-cpa" class="cursor-pointer select-none" :class="form.register_only ? 'text-slate-400' : ''">
-          结束后自动推送到 CPA
-          <span class="text-slate-500 text-xs">(只推本次 run 成功 OAuth 的账号；已存在同名文件会跳过，不覆盖)</span>
+          {{ autoPushTitle }}
+          <span class="text-slate-500 text-xs">{{ autoPushHint }}</span>
         </label>
       </div>
 
@@ -365,7 +393,9 @@ onBeforeUnmount(() => {
           <div class="flex flex-wrap items-center gap-2 text-xs">
             <span v-if="focused.params?.register_only" class="tag-neutral">模式: 仅注册</span>
             <span v-else class="tag-neutral">模式: 全流程</span>
-            <span v-if="focused.params?.auto_push_cpa" class="tag-ok">CPA 自动推送: 开启</span>
+            <span class="tag-neutral">踢出策略: {{ kickModeLabel(focused.params?.kick_mode) }}</span>
+            <span v-if="focused.params?.auto_push_cpa && focused.params?.kick_mode === 'after_each_auth'" class="tag-ok">CPA 自动推送: 逐账号即时</span>
+            <span v-else-if="focused.params?.auto_push_cpa" class="tag-ok">CPA 自动推送: run 结束后</span>
             <span v-else class="tag-neutral">CPA 自动推送: 关闭</span>
           </div>
 

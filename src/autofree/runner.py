@@ -14,8 +14,12 @@ Single-round flow (N accounts):
     5. for acc in cohort:
            tokens = flow.oauth_personal(acc.email, acc.password)
            cpa_push.save_and_register(acc.email, tokens)
-    6. for acc in cohort:
-           master.kick_user_by_email(acc.email)
+           if immediate-kick mode:
+               master.kick_user_by_email(acc.email)
+               cpa_push.push_one(acc.email)
+    6. if round-end-kick mode:
+           for acc in cohort:
+               master.kick_user_by_email(acc.email)
 
 Multi-round = R × single-round, all serial.
 
@@ -56,6 +60,10 @@ STAGE_KICK = "kick"
 STAGE_CPA_PUSH = "cpa_push"
 STAGE_DONE = "done"
 STAGE_REGISTER_ONLY_DONE = "register_only_done"
+
+KICK_MODE_ROUND_END = "round_end"
+KICK_MODE_AFTER_EACH_AUTH = "after_each_auth"
+_KICK_MODES = {KICK_MODE_ROUND_END, KICK_MODE_AFTER_EACH_AUTH}
 
 
 # ============================================================ cancel signal
@@ -153,6 +161,98 @@ def _ensure_cpa_ready_for_auto_push() -> None:
         raise ValueError("已勾选自动推送 CPA,但 CPA 未配置 base_url / key")
 
 
+def normalize_kick_mode(value: str | None) -> str:
+    mode = (value or KICK_MODE_ROUND_END).strip().lower()
+    if mode not in _KICK_MODES:
+        allowed = ", ".join(sorted(_KICK_MODES))
+        raise ValueError(f"不支持的 kick_mode: {value!r} (允许: {allowed})")
+    return mode
+
+
+def _new_cpa_summary(enabled: bool) -> dict[str, Any]:
+    return {"enabled": enabled, "attempted": 0, "pushed": 0, "skipped": 0, "failed": 0}
+
+
+def _merge_cpa_summary(total: dict[str, Any], partial: dict[str, Any] | None) -> None:
+    if not partial:
+        return
+    total["enabled"] = bool(total.get("enabled") or partial.get("enabled"))
+    for field in ("attempted", "pushed", "skipped", "failed"):
+        total[field] = int(total.get(field) or 0) + int(partial.get(field) or 0)
+    if partial.get("skipped_reason") and not total.get("skipped_reason"):
+        total["skipped_reason"] = partial["skipped_reason"]
+
+
+def _append_member_error(member: dict[str, Any], message: str) -> None:
+    message = (message or "").strip()
+    if not message:
+        return
+    existing = (member.get("error") or "").strip()
+    member["error"] = f"{existing}; {message}" if existing else message
+
+
+def _kick_member(
+    *,
+    run_id: str,
+    round_index: int,
+    ordinal: int,
+    total: int,
+    member: dict[str, Any],
+    master_client: Any,
+    summary: dict[str, Any],
+    log: Callable[[str, str], None],
+) -> None:
+    email = member["email"]
+    log(f"[Round {round_index}] step 6/6 — kick {ordinal}/{total} {email}")
+    try:
+        ok, reason = master_client.kick_user_by_email(email)
+        if ok:
+            member["kicked"] = True
+            summary["kicked"] += 1
+            log(f"  ✓ kicked {email}")
+        else:
+            member["kicked"] = False
+            _append_member_error(member, f"kick: {reason}")
+            summary["errors"].append({"email": email, "where": "kick", "msg": reason})
+            log(f"  ⚠ kick 失败 {email}: {reason}", "warning")
+    except Exception as exc:
+        member["kicked"] = False
+        _append_member_error(member, f"kick: {exc}")
+        summary["errors"].append({"email": email, "where": "kick", "msg": str(exc)})
+        log(f"  ✗ kick 异常 {email}: {exc}", "error")
+    storage.update_cohort_member(run_id, email, member)
+
+
+def _push_run_auth_now(run_id: str, email: str) -> dict[str, Any]:
+    log = _logger_for(run_id)
+    try:
+        result = cpa_push.push_one(email, overwrite=False)
+    except Exception as exc:
+        log(f"[CPA] ✗ 推送失败 {email}: {exc}", "error")
+        return {"ok": False, "skipped": False, "error": str(exc), "email": email}
+
+    result = {"email": email, **result}
+    if result.get("ok"):
+        log(f"[CPA] ✓ 已推送 {email}")
+    elif result.get("skipped"):
+        reason = result.get("reason") or "skipped"
+        log(f"[CPA] - 跳过 {email}: {reason}", "warning")
+    else:
+        reason = result.get("error") or result.get("reason") or "unknown error"
+        log(f"[CPA] ✗ 推送失败 {email}: {reason}", "error")
+    return result
+
+
+def _record_cpa_result(bucket: dict[str, Any], result: dict[str, Any]) -> None:
+    bucket["attempted"] = int(bucket.get("attempted") or 0) + 1
+    if result.get("ok"):
+        bucket["pushed"] = int(bucket.get("pushed") or 0) + 1
+    elif result.get("skipped"):
+        bucket["skipped"] = int(bucket.get("skipped") or 0) + 1
+    else:
+        bucket["failed"] = int(bucket.get("failed") or 0) + 1
+
+
 # ============================================================ flow.py adapter
 
 
@@ -180,10 +280,13 @@ def _run_round(
     cancel: CancelSignal,
     mail_provider: str | None = None,
     register_only: bool = False,
+    auto_push_cpa: bool = False,
+    kick_mode: str = KICK_MODE_ROUND_END,
 ) -> dict[str, Any]:
     """Execute one round of N accounts. Returns per-round summary."""
     log = _logger_for(run_id)
     Flow = _build_flow()
+    kick_mode = normalize_kick_mode(kick_mode)
 
     proxy = get_proxy() or None
     mail = get_mail_client(mail_provider)
@@ -199,6 +302,7 @@ def _run_round(
         "kicked": 0,
         "errors": [],
         "oauth_emails": [],
+        "cpa": _new_cpa_summary(enabled=auto_push_cpa and kick_mode == KICK_MODE_AFTER_EACH_AUTH),
     }
 
     # ---- 1. AP off ----
@@ -298,6 +402,7 @@ def _run_round(
             raise RuntimeError(f"cancelled at oauth {i}/{len(successes)}")
 
         email = member["email"]
+        oauth_ok = False
         log(f"[Round {round_index}] step 5/6 — OAuth {i}/{len(successes)} {email}")
         flow = Flow(
             proxy=proxy, tag=email.split("@")[0], mail_client=mail,
@@ -312,6 +417,8 @@ def _run_round(
                 raise RuntimeError(reason)
             cpa_push.save_and_register(email, tokens, extra={"run_id": run_id, "round": round_index})
             member["stage"] = "oauthed"
+            member["error"] = ""
+            oauth_ok = True
             summary["oauthed"] += 1
             summary["oauth_emails"].append(email)
             log(f"  ✓ OAuth + 落盘成功 {email}")
@@ -325,29 +432,46 @@ def _run_round(
                 flow.close()
             except Exception:
                 pass
-            storage.update_cohort_member(run_id, email, member)
+        storage.update_cohort_member(run_id, email, member)
+
+        if kick_mode == KICK_MODE_AFTER_EACH_AUTH:
+            storage.update_run(run_id, current_stage=STAGE_KICK)
+            _kick_member(
+                run_id=run_id,
+                round_index=round_index,
+                ordinal=i,
+                total=len(successes),
+                member=member,
+                master_client=master_client,
+                summary=summary,
+                log=log,
+            )
+            if oauth_ok and auto_push_cpa:
+                storage.update_run(run_id, current_stage=STAGE_CPA_PUSH)
+                result = _push_run_auth_now(run_id, email)
+                _record_cpa_result(summary["cpa"], result)
+                if not result.get("ok") and not result.get("skipped"):
+                    reason = result.get("error") or result.get("reason") or "unknown error"
+                    _append_member_error(member, f"cpa_push: {reason}")
+                    summary["errors"].append({"email": email, "where": "cpa_push", "msg": reason})
+                    storage.update_cohort_member(run_id, email, member)
 
     # ---- 6. kick everyone in this cohort (regardless of OAuth success) ----
+    if kick_mode == KICK_MODE_AFTER_EACH_AUTH:
+        return summary
+
     storage.update_run(run_id, current_stage=STAGE_KICK)
     for i, member in enumerate(cohort, 1):
-        email = member["email"]
-        log(f"[Round {round_index}] step 6/6 — kick {i}/{len(cohort)} {email}")
-        try:
-            ok, reason = master_client.kick_user_by_email(email)
-            if ok:
-                member["kicked"] = True
-                summary["kicked"] += 1
-                log(f"  ✓ kicked {email}")
-            else:
-                member["kicked"] = False
-                summary["errors"].append({"email": email, "where": "kick", "msg": reason})
-                log(f"  ⚠ kick 失败 {email}: {reason}", "warning")
-        except Exception as exc:
-            member["kicked"] = False
-            member["error"] = (member.get("error") or "") + f"; kick: {exc}"
-            summary["errors"].append({"email": email, "where": "kick", "msg": str(exc)})
-            log(f"  ✗ kick 异常 {email}: {exc}", "error")
-        storage.update_cohort_member(run_id, email, member)
+        _kick_member(
+            run_id=run_id,
+            round_index=round_index,
+            ordinal=i,
+            total=len(cohort),
+            member=member,
+            master_client=master_client,
+            summary=summary,
+            log=log,
+        )
 
     return summary
 
@@ -403,16 +527,19 @@ def _run_multi_inner(
     mail_provider: str | None,
     register_only: bool = False,
     auto_push_cpa: bool = False,
+    kick_mode: str = KICK_MODE_ROUND_END,
 ) -> None:
     log = _logger_for(run_id)
+    kick_mode = normalize_kick_mode(kick_mode)
     cancel = CancelSignal()
     with _CANCELS_LOCK:
         _CANCELS[run_id] = cancel
 
     storage.update_run(run_id, status="running", started_at=_now_iso(), current_stage=STAGE_INIT)
     mode_label = "仅注册" if register_only else "全流程"
+    kick_label = "逐账号即时 kick" if kick_mode == KICK_MODE_AFTER_EACH_AUTH else "统一收尾 kick"
     cpa_label = "auto-cpa=on" if auto_push_cpa else "auto-cpa=off"
-    log(f"=== 任务启动: rounds={rounds} per_round={per_round} mode={mode_label} {cpa_label} ===")
+    log(f"=== 任务启动: rounds={rounds} per_round={per_round} mode={mode_label} kick={kick_label} {cpa_label} ===")
 
     total = {
         "registered": 0,
@@ -420,7 +547,7 @@ def _run_multi_inner(
         "kicked": 0,
         "errors": [],
         "oauth_emails": [],
-        "cpa": {"enabled": auto_push_cpa, "attempted": 0, "pushed": 0, "skipped": 0, "failed": 0},
+        "cpa": _new_cpa_summary(enabled=auto_push_cpa),
     }
     final_status = "done"
     fatal_error = ""
@@ -436,12 +563,14 @@ def _run_multi_inner(
                 summary = _run_round(
                     n=per_round, run_id=run_id, round_index=r, cancel=cancel,
                     mail_provider=mail_provider, register_only=register_only,
+                    auto_push_cpa=auto_push_cpa, kick_mode=kick_mode,
                 )
                 total["registered"] += summary["registered"]
                 total["oauthed"] += summary["oauthed"]
                 total["kicked"] += summary["kicked"]
                 total["errors"].extend(summary["errors"])
                 total["oauth_emails"].extend(summary["oauth_emails"])
+                _merge_cpa_summary(total["cpa"], summary.get("cpa"))
             except Exception as exc:
                 # round-level fatal — log and continue to next round unless cancelled.
                 log(f"[Round {r}] 轮级失败: {exc}", "error")
@@ -463,6 +592,9 @@ def _run_multi_inner(
         if register_only:
             log("[CPA] 当前是仅注册模式,跳过自动推送", "warning")
             total["cpa"]["skipped_reason"] = "register_only"
+        elif kick_mode == KICK_MODE_AFTER_EACH_AUTH:
+            if total["cpa"].get("failed") and final_status == "done":
+                final_status = "done_with_errors"
         elif final_status == "cancelled":
             log("[CPA] 任务已取消,跳过自动推送", "warning")
             total["cpa"]["skipped_reason"] = "cancelled"
@@ -513,6 +645,7 @@ def start_run(
     mail_provider: str | None = None,
     register_only: bool = False,
     auto_push_cpa: bool = False,
+    kick_mode: str = KICK_MODE_ROUND_END,
 ) -> dict[str, Any]:
     """Validate inputs, create the run record, kick off the worker thread.
     Returns the initial run record (with `id`)."""
@@ -522,6 +655,7 @@ def start_run(
         raise ValueError("rounds 与 per_round 都必须 >= 1")
     if per_round > TEAM_HARD_CAP:
         raise ValueError(f"per_round 不能超过 {TEAM_HARD_CAP}")
+    kick_mode = normalize_kick_mode(kick_mode)
     if auto_push_cpa:
         _ensure_cpa_ready_for_auto_push()
 
@@ -533,11 +667,12 @@ def start_run(
             "proxy": get_proxy(),
             "register_only": register_only,
             "auto_push_cpa": auto_push_cpa,
+            "kick_mode": kick_mode,
         },
     )
     threading.Thread(
         target=_run_multi_inner,
-        args=(record["id"], rounds, per_round, mail_provider, register_only, auto_push_cpa),
+        args=(record["id"], rounds, per_round, mail_provider, register_only, auto_push_cpa, kick_mode),
         name=f"autofree-run-{record['id']}",
         daemon=True,
     ).start()
@@ -554,9 +689,11 @@ def run_blocking(
     mail_provider: str | None = None,
     register_only: bool = False,
     auto_push_cpa: bool = False,
+    kick_mode: str = KICK_MODE_ROUND_END,
 ) -> dict[str, Any]:
     """Synchronous variant for CLI use — blocks until the run finishes,
     returns the final run record."""
+    kick_mode = normalize_kick_mode(kick_mode)
     if auto_push_cpa:
         _ensure_cpa_ready_for_auto_push()
     record = storage.create_run(
@@ -567,7 +704,8 @@ def run_blocking(
             "proxy": get_proxy(),
             "register_only": register_only,
             "auto_push_cpa": auto_push_cpa,
+            "kick_mode": kick_mode,
         },
     )
-    _run_multi_inner(record["id"], rounds, per_round, mail_provider, register_only, auto_push_cpa)
+    _run_multi_inner(record["id"], rounds, per_round, mail_provider, register_only, auto_push_cpa, kick_mode)
     return storage.get_run(record["id"]) or record
