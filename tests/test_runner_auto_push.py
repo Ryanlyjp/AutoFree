@@ -219,3 +219,162 @@ def test_immediate_kick_mode_pushes_each_auth_before_next_oauth(
         "kick:user-2@example.com",
         "push:user-2@example.com",
     ]
+
+
+def test_easyproxy_reuses_same_port_for_register_and_oauth(
+    monkeypatch: pytest.MonkeyPatch, isolated_data_dirs: None
+) -> None:
+    record = storage.create_run(rounds=1, per_round=1, params={"easyproxy": {"enabled": True}})
+    proxies: list[str | None] = []
+    mailboxes = iter([("box-1", "user-1@example.com")])
+
+    class FakeMail:
+        def login(self) -> None:
+            return None
+
+        def create_temp_email(self):
+            return next(mailboxes)
+
+    class FakeMasterClient:
+        account_id = "acct_123"
+
+        def set_auto_provision(self, value: bool) -> None:
+            return None
+
+        def set_default_seat_type(self, value: str) -> None:
+            return None
+
+        def list_members(self) -> list[dict]:
+            return []
+
+        def kick_user_by_email(self, email: str):
+            return True, ""
+
+    class FakeFlow:
+        oauth_fail_reason = ""
+
+        def __init__(self, **kwargs):
+            proxies.append(kwargs.get("proxy"))
+
+        def set_mail_context(self, mailbox_id):
+            self.mailbox_id = mailbox_id
+
+        def start(self) -> None:
+            return None
+
+        def run_register(self, email: str, password: str, name: str, birthdate: str) -> None:
+            return None
+
+        def oauth_personal(self, email: str, password: str) -> dict[str, str]:
+            return {"access_token": f"access-{email}", "refresh_token": "refresh", "id_token": "id-token"}
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(runner, "_build_flow", lambda: FakeFlow)
+    monkeypatch.setattr(runner, "get_mail_client", lambda provider=None: FakeMail())
+    monkeypatch.setattr(runner.master, "get_default_client", lambda: FakeMasterClient())
+    monkeypatch.setattr(runner, "easyproxy_enabled", lambda: True)
+    monkeypatch.setattr(
+        runner.easyproxy,
+        "select_proxy_assignment",
+        lambda avoid_ports=None: {
+            "proxy_url": "http://127.0.0.1:24001",
+            "port": 24001,
+            "tag": "node-1",
+            "name": "node-1",
+        },
+    )
+    monkeypatch.setattr(runner, "AP_PROPAGATION_DELAY", 0)
+    monkeypatch.setattr(runner, "_interruptible_sleep", lambda seconds, cancel: None)
+    monkeypatch.setattr(cpa_push, "save_and_register", lambda email, tokens, *, extra=None: Path(f"/tmp/{email}.json"))
+
+    summary = runner._run_round(
+        n=1,
+        run_id=record["id"],
+        round_index=1,
+        cancel=runner.CancelSignal(),
+        auto_push_cpa=False,
+        kick_mode=runner.KICK_MODE_ROUND_END,
+    )
+
+    assert summary["registered"] == 1
+    assert summary["oauthed"] == 1
+    assert proxies == ["http://127.0.0.1:24001", "http://127.0.0.1:24001"]
+
+    rec = storage.get_run(record["id"])
+    assert rec is not None
+    assert rec["cohort"][0]["proxy_mode"] == "easyproxy"
+    assert rec["cohort"][0]["proxy_port"] == 24001
+
+
+def test_easyproxy_network_failure_blacklists_assigned_port(
+    monkeypatch: pytest.MonkeyPatch, isolated_data_dirs: None
+) -> None:
+    record = storage.create_run(rounds=1, per_round=1, params={"easyproxy": {"enabled": True}})
+    mailboxes = iter([("box-1", "user-1@example.com")])
+    blacklisted: list[tuple[int, str]] = []
+
+    class FakeMail:
+        def login(self) -> None:
+            return None
+
+        def create_temp_email(self):
+            return next(mailboxes)
+
+    class FakeMasterClient:
+        account_id = "acct_123"
+
+        def set_auto_provision(self, value: bool) -> None:
+            return None
+
+        def list_members(self) -> list[dict]:
+            return []
+
+    class FakeFlow:
+        oauth_fail_reason = ""
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def set_mail_context(self, mailbox_id):
+            self.mailbox_id = mailbox_id
+
+        def start(self) -> None:
+            return None
+
+        def run_register(self, email: str, password: str, name: str, birthdate: str) -> None:
+            raise RuntimeError("APIRequestContext.get: read ECONNRESET")
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(runner, "_build_flow", lambda: FakeFlow)
+    monkeypatch.setattr(runner, "get_mail_client", lambda provider=None: FakeMail())
+    monkeypatch.setattr(runner.master, "get_default_client", lambda: FakeMasterClient())
+    monkeypatch.setattr(runner, "easyproxy_enabled", lambda: True)
+    monkeypatch.setattr(
+        runner.easyproxy,
+        "select_proxy_assignment",
+        lambda avoid_ports=None: {
+            "proxy_url": "http://127.0.0.1:24005",
+            "port": 24005,
+            "tag": "node-5",
+            "name": "node-5",
+        },
+    )
+    monkeypatch.setattr(
+        runner.easyproxy,
+        "mark_port_bad",
+        lambda port, reason, *, tag="", name="": blacklisted.append((port, reason)),
+    )
+
+    summary = runner._run_round(
+        n=1,
+        run_id=record["id"],
+        round_index=1,
+        cancel=runner.CancelSignal(),
+    )
+
+    assert summary["registered"] == 0
+    assert blacklisted == [(24005, "APIRequestContext.get: read ECONNRESET")]

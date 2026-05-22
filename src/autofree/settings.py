@@ -15,10 +15,48 @@ from autofree.config import SETTINGS_FILE
 
 _LOCK = threading.RLock()
 
+PROXY_MASTER_MODE_FOLLOW = "follow_proxy"
+PROXY_MASTER_MODE_DIRECT = "direct"
+_PROXY_MASTER_MODES = {PROXY_MASTER_MODE_FOLLOW, PROXY_MASTER_MODE_DIRECT}
+
+EASYPROXY_MASTER_MODE_DIRECT = "direct"
+EASYPROXY_MASTER_MODE_POOL = "follow_pool"
+_EASYPROXY_MASTER_MODES = {EASYPROXY_MASTER_MODE_DIRECT, EASYPROXY_MASTER_MODE_POOL}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
 
 def _seed_from_env() -> dict[str, Any]:
     return {
         "proxy": os.environ.get("HTTP_PROXY", ""),
+        "proxy_master_mode": os.environ.get("MASTER_PROXY_MODE", PROXY_MASTER_MODE_FOLLOW),
+        "easyproxy": {
+            "enabled": False,
+            "management_url": os.environ.get("EASYPROXY_MANAGEMENT_URL", "http://127.0.0.1:9888"),
+            "password": os.environ.get("EASYPROXY_PASSWORD", ""),
+            "proxy_host": os.environ.get("EASYPROXY_PROXY_HOST", "127.0.0.1"),
+            "pool_port": _env_int("EASYPROXY_POOL_PORT", 2323),
+            "port_min": _env_int("EASYPROXY_PORT_MIN", 24000),
+            "port_max": _env_int("EASYPROXY_PORT_MAX", 24100),
+            "cooldown_minutes": _env_int("EASYPROXY_COOLDOWN_MINUTES", 60),
+            "master_mode": os.environ.get("EASYPROXY_MASTER_MODE", EASYPROXY_MASTER_MODE_DIRECT),
+            "local_blacklist": {},
+        },
         "mail": {
             "provider": os.environ.get("MAIL_PROVIDER", "tempmail"),
             "cf_temp_email": {
@@ -98,6 +136,49 @@ def get_proxy() -> str:
 
 def set_proxy(value: str) -> None:
     update({"proxy": (value or "").strip()})
+
+
+def get_proxy_master_mode() -> str:
+    mode = str(get_all().get("proxy_master_mode") or PROXY_MASTER_MODE_FOLLOW).strip().lower()
+    if mode not in _PROXY_MASTER_MODES:
+        return PROXY_MASTER_MODE_FOLLOW
+    return mode
+
+
+def get_easyproxy_config() -> dict[str, Any]:
+    data = (get_all().get("easyproxy") or {}).copy()
+    master_mode = str(data.get("master_mode") or EASYPROXY_MASTER_MODE_DIRECT).strip().lower()
+    if master_mode not in _EASYPROXY_MASTER_MODES:
+        master_mode = EASYPROXY_MASTER_MODE_DIRECT
+    return {
+        "enabled": bool(data.get("enabled")),
+        "management_url": str(data.get("management_url") or "http://127.0.0.1:9888").strip(),
+        "password": str(data.get("password") or ""),
+        "proxy_host": str(data.get("proxy_host") or "127.0.0.1").strip() or "127.0.0.1",
+        "pool_port": _coerce_int(data.get("pool_port"), 2323),
+        "port_min": _coerce_int(data.get("port_min"), 24000),
+        "port_max": _coerce_int(data.get("port_max"), 24100),
+        "cooldown_minutes": _coerce_int(data.get("cooldown_minutes"), 60),
+        "master_mode": master_mode,
+        "local_blacklist": dict(data.get("local_blacklist") or {}),
+    }
+
+
+def easyproxy_enabled() -> bool:
+    return bool(get_easyproxy_config().get("enabled"))
+
+
+def get_master_proxy_url() -> str:
+    easyproxy = get_easyproxy_config()
+    if easyproxy.get("enabled"):
+        if easyproxy.get("master_mode") == EASYPROXY_MASTER_MODE_POOL:
+            host = easyproxy.get("proxy_host") or "127.0.0.1"
+            port = int(easyproxy.get("pool_port") or 2323)
+            return f"http://{host}:{port}"
+        return ""
+    if get_proxy_master_mode() == PROXY_MASTER_MODE_FOLLOW:
+        return get_all().get("proxy") or ""
+    return ""
 
 
 def get_mail_provider() -> str:

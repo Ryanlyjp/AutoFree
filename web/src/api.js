@@ -43,6 +43,8 @@ export const api = {
   mailProbe: (provider) => request("POST", "/api/mail/probe", { provider }),
   cpaProbe: () => request("POST", "/api/cpa/probe"),
   proxyProbe: () => request("POST", "/api/proxy/probe"),
+  easyproxyStatus: () => request("GET", "/api/easyproxy/status"),
+  easyproxyRelease: (payload) => request("POST", "/api/easyproxy/release", payload || {}),
 
   masterState: () => request("GET", "/api/master/state"),
   masterImportToken: (payload) => request("POST", "/api/master/import-token", payload),

@@ -3,6 +3,7 @@ import { computed, onMounted, reactive, ref } from "vue";
 import { api } from "../api.js";
 
 const emit = defineEmits(["master-changed"]);
+const MASK_RE = /^<set:\d+>$/;
 
 // ---- settings ----------------------------------------------------------------
 
@@ -37,13 +38,32 @@ async function patch(payload) {
 
 // ---- proxy ----
 
-const proxyForm = reactive({ value: "" });
+const proxyForm = reactive({ value: "", master_mode: "follow_proxy" });
 const proxyProbe = ref(null);
+const easyproxyForm = reactive({
+  enabled: false,
+  management_url: "http://127.0.0.1:9888",
+  password: "",
+  proxy_host: "127.0.0.1",
+  pool_port: 2323,
+  port_min: 24000,
+  port_max: 24100,
+  cooldown_minutes: 60,
+  master_mode: "direct",
+});
+const easyproxyStatus = ref(null);
+const easyproxyReleasing = ref(false);
+const standardProxyDisabled = computed(() => !!easyproxyForm.enabled);
+const easyproxyPorts = computed(() => easyproxyStatus.value?.ports || []);
+const easyproxySummary = computed(() => easyproxyStatus.value?.summary || null);
+
 function loadProxyFromSettings() {
   proxyForm.value = settings.value?.proxy || "";
+  proxyForm.master_mode = settings.value?.proxy_master_mode || "follow_proxy";
 }
 async function saveProxy() {
-  await patch({ proxy: proxyForm.value });
+  await patch({ proxy: proxyForm.value, proxy_master_mode: proxyForm.master_mode });
+  loadProxyFromSettings();
 }
 async function probeProxy() {
   proxyProbe.value = { running: true };
@@ -51,6 +71,57 @@ async function probeProxy() {
     proxyProbe.value = await api.proxyProbe();
   } catch (e) {
     proxyProbe.value = { ok: false, error: e.message };
+  }
+}
+
+function loadEasyProxyFromSettings() {
+  const s = settings.value?.easyproxy || {};
+  easyproxyForm.enabled = !!s.enabled;
+  easyproxyForm.management_url = s.management_url || "http://127.0.0.1:9888";
+  easyproxyForm.password = s.password || "";
+  easyproxyForm.proxy_host = s.proxy_host || "127.0.0.1";
+  easyproxyForm.pool_port = Number(s.pool_port || 2323);
+  easyproxyForm.port_min = Number(s.port_min || 24000);
+  easyproxyForm.port_max = Number(s.port_max || 24100);
+  easyproxyForm.cooldown_minutes = Number(s.cooldown_minutes || 60);
+  easyproxyForm.master_mode = s.master_mode || "direct";
+}
+
+async function saveEasyProxy() {
+  const payload = {
+    enabled: easyproxyForm.enabled,
+    management_url: easyproxyForm.management_url,
+    proxy_host: easyproxyForm.proxy_host,
+    pool_port: Number(easyproxyForm.pool_port),
+    port_min: Number(easyproxyForm.port_min),
+    port_max: Number(easyproxyForm.port_max),
+    cooldown_minutes: Number(easyproxyForm.cooldown_minutes),
+    master_mode: easyproxyForm.master_mode,
+  };
+  if (easyproxyForm.password && !MASK_RE.test(easyproxyForm.password)) {
+    payload.password = easyproxyForm.password;
+  }
+  await patch({ easyproxy: payload });
+  loadEasyProxyFromSettings();
+}
+
+async function probeEasyProxy() {
+  easyproxyStatus.value = { running: true };
+  try {
+    easyproxyStatus.value = await api.easyproxyStatus();
+  } catch (e) {
+    easyproxyStatus.value = { ok: false, error: e.message };
+  }
+}
+
+async function releaseEasyProxy(ports = null) {
+  easyproxyReleasing.value = true;
+  try {
+    easyproxyStatus.value = await api.easyproxyRelease({ ports, remote: true });
+  } catch (e) {
+    error.value = e.message;
+  } finally {
+    easyproxyReleasing.value = false;
   }
 }
 
@@ -230,6 +301,7 @@ const masterSummary = computed(() => {
 onMounted(async () => {
   await load();
   loadProxyFromSettings();
+  loadEasyProxyFromSettings();
   loadMailFromSettings();
   loadCpaFromSettings();
   await refreshMaster();
@@ -245,11 +317,19 @@ onMounted(async () => {
     <section class="card space-y-3">
       <header class="flex items-center justify-between">
         <h2 class="text-base font-semibold">代理</h2>
-        <span class="text-xs text-slate-500">浏览器和后端请求都会走此代理。留空 = 不使用</span>
+        <span class="text-xs text-slate-500">普通代理模块。easyproxy 启用后此区停用</span>
       </header>
+      <div v-if="standardProxyDisabled" class="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+        easyproxy 已启用。当前普通 proxy 仅保留配置，不参与运行，避免和 easyproxy 冲突。
+      </div>
       <div>
         <label class="label">Proxy URL</label>
-        <input v-model="proxyForm.value" class="input" placeholder="socks5://127.0.0.1:1080" />
+        <input
+          v-model="proxyForm.value"
+          class="input"
+          placeholder="socks5://127.0.0.1:1080"
+          :disabled="standardProxyDisabled"
+        />
         <p class="mt-2 text-xs text-slate-500">
           格式说明：填写一个完整 URL，不是 <code>IP,PORT,USER,PWD</code>。
           例如 <code>http://127.0.0.1:7890</code>、
@@ -257,14 +337,138 @@ onMounted(async () => {
           <code>socks5://user:pass@127.0.0.1:1080</code>。
         </p>
       </div>
+      <div class="max-w-xs">
+        <label class="label">Master 请求</label>
+        <select v-model="proxyForm.master_mode" class="select" :disabled="standardProxyDisabled">
+          <option value="follow_proxy">跟随普通 proxy</option>
+          <option value="direct">Master 直连</option>
+        </select>
+      </div>
       <div class="flex items-center gap-3">
-        <button class="btn-primary" @click="saveProxy">保存</button>
-        <button class="btn-secondary" @click="probeProxy">测试连通</button>
+        <button class="btn-primary" :disabled="standardProxyDisabled" @click="saveProxy">保存</button>
+        <button class="btn-secondary" :disabled="standardProxyDisabled" @click="probeProxy">测试连通</button>
         <span v-if="proxyProbe?.running" class="text-xs text-slate-500">probing...</span>
         <span v-else-if="proxyProbe?.ok" class="tag-ok">OK · {{ proxyProbe.latency_ms }}ms (HTTP {{ proxyProbe.status }})</span>
         <span v-else-if="proxyProbe" class="tag-err" :title="proxyProbe.error">FAIL</span>
       </div>
       <p v-if="proxyProbe && !proxyProbe.ok && proxyProbe.error" class="text-xs text-rose-600">{{ proxyProbe.error }}</p>
+    </section>
+
+    <section class="card space-y-3">
+      <header class="flex items-center justify-between">
+        <h2 class="text-base font-semibold">easyproxy</h2>
+        <span class="text-xs text-slate-500">hybrid 模式下按账号固定一个端口，注册和 OAuth 复用</span>
+      </header>
+      <div class="flex items-center gap-2 text-sm">
+        <input id="easyproxy-enabled" v-model="easyproxyForm.enabled" type="checkbox" class="h-4 w-4 rounded border-slate-300" />
+        <label for="easyproxy-enabled" class="cursor-pointer select-none">
+          启用 easyproxy 账号端口池
+          <span class="text-slate-500 text-xs">(启用后普通 proxy 模块停用)</span>
+        </label>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="label">management_url</label>
+          <input v-model="easyproxyForm.management_url" class="input" placeholder="http://127.0.0.1:9888" />
+        </div>
+        <div>
+          <label class="label">管理密码</label>
+          <input v-model="easyproxyForm.password" class="input" type="password" placeholder="留空表示保持当前值" />
+        </div>
+        <div>
+          <label class="label">本机代理 Host</label>
+          <input v-model="easyproxyForm.proxy_host" class="input" placeholder="127.0.0.1" />
+        </div>
+        <div>
+          <label class="label">2323 池端口</label>
+          <input v-model.number="easyproxyForm.pool_port" type="number" min="1" max="65535" class="input" />
+        </div>
+        <div>
+          <label class="label">开始端口</label>
+          <input v-model.number="easyproxyForm.port_min" type="number" min="1" max="65535" class="input" />
+        </div>
+        <div>
+          <label class="label">结束端口</label>
+          <input v-model.number="easyproxyForm.port_max" type="number" min="1" max="65535" class="input" />
+        </div>
+        <div>
+          <label class="label">本地拉黑冷却 (分钟)</label>
+          <input v-model.number="easyproxyForm.cooldown_minutes" type="number" min="1" max="1440" class="input" />
+        </div>
+        <div>
+          <label class="label">Master 请求</label>
+          <select v-model="easyproxyForm.master_mode" class="select">
+            <option value="direct">Master 直连</option>
+            <option value="follow_pool">Master 走 2323 池</option>
+          </select>
+        </div>
+      </div>
+      <div class="flex items-center gap-3">
+        <button class="btn-primary" @click="saveEasyProxy">保存</button>
+        <button class="btn-secondary" @click="probeEasyProxy">刷新状态</button>
+        <button
+          class="btn-secondary"
+          :disabled="easyproxyReleasing || !(easyproxySummary?.local_blacklisted > 0)"
+          @click="releaseEasyProxy()"
+        >{{ easyproxyReleasing ? '释放中…' : '释放全部本地黑名单' }}</button>
+        <span v-if="easyproxyStatus?.running" class="text-xs text-slate-500">probing...</span>
+        <span v-else-if="easyproxyStatus?.ok" class="tag-ok">
+          可用 {{ easyproxySummary?.selectable ?? 0 }} / {{ easyproxySummary?.total ?? 0 }}
+        </span>
+        <span v-else-if="easyproxyStatus" class="tag-err" :title="easyproxyStatus.error">FAIL</span>
+      </div>
+      <p class="text-xs text-slate-500">
+        说明：这里按管理 API 的真实端口列表筛选 <code>开始端口 ~ 结束端口</code>，不会假设一定从 24000 连续排到末尾。
+      </p>
+      <p v-if="easyproxyStatus && !easyproxyStatus.ok && easyproxyStatus.error" class="text-xs text-rose-600">
+        {{ easyproxyStatus.error }}
+      </p>
+      <div v-if="easyproxyStatus?.ok" class="space-y-2">
+        <div class="flex flex-wrap gap-2 text-xs">
+          <span class="tag-neutral">远端可用 {{ easyproxySummary?.remote_available ?? 0 }}</span>
+          <span class="tag-neutral">本地黑名单 {{ easyproxySummary?.local_blacklisted ?? 0 }}</span>
+          <span class="tag-neutral">Master {{ easyproxyForm.master_mode === 'direct' ? '直连' : '2323 池' }}</span>
+        </div>
+        <div class="border rounded text-xs max-h-72 overflow-y-auto">
+          <table class="min-w-full">
+            <thead class="bg-slate-50">
+              <tr>
+                <th class="text-left px-2 py-1">port</th>
+                <th class="text-left px-2 py-1">tag</th>
+                <th class="text-left px-2 py-1">状态</th>
+                <th class="text-left px-2 py-1">说明</th>
+                <th class="text-left px-2 py-1"></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="entry in easyproxyPorts" :key="entry.port" class="border-t">
+                <td class="px-2 py-1 font-mono">{{ entry.port }}</td>
+                <td class="px-2 py-1">{{ entry.tag || entry.name || '-' }}</td>
+                <td class="px-2 py-1">
+                  <span v-if="entry.selectable" class="tag-ok">可选</span>
+                  <span v-else-if="entry.local_blacklisted" class="tag-warn">本地拉黑</span>
+                  <span v-else-if="entry.remote_blacklisted" class="tag-warn">远端拉黑</span>
+                  <span v-else class="tag-neutral">{{ entry.available ? '占用/不可选' : '不可用' }}</span>
+                </td>
+                <td class="px-2 py-1 text-slate-500 max-w-sm truncate" :title="entry.local_blacklist_reason || entry.last_error">
+                  {{ entry.local_blacklist_reason || entry.last_error || '-' }}
+                </td>
+                <td class="px-2 py-1">
+                  <button
+                    v-if="entry.local_blacklisted || entry.remote_blacklisted"
+                    class="text-indigo-600 hover:text-indigo-800 text-xs underline"
+                    :disabled="easyproxyReleasing"
+                    @click="releaseEasyProxy([entry.port])"
+                  >释放</button>
+                </td>
+              </tr>
+              <tr v-if="!easyproxyPorts.length">
+                <td colspan="5" class="px-2 py-2 text-slate-400">当前范围内没有可展示的 hybrid 端口</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </section>
 
     <!-- mail -->

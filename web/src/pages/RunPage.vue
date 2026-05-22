@@ -212,6 +212,16 @@ function kickModeLabel(mode) {
   return mode === "after_each_auth" ? "逐账号即时 kick" : "统一收尾 kick";
 }
 
+function memberProxyLabel(member) {
+  if (member?.proxy_mode === "easyproxy" && member?.proxy_port) {
+    return `easyproxy:${member.proxy_port}`;
+  }
+  if (member?.proxy_mode === "proxy") {
+    return "proxy";
+  }
+  return "direct";
+}
+
 const masterReady = computed(() => props.master?.has_session_token && props.master?.account_id);
 
 watch(
@@ -393,6 +403,12 @@ onBeforeUnmount(() => {
           <div class="flex flex-wrap items-center gap-2 text-xs">
             <span v-if="focused.params?.register_only" class="tag-neutral">模式: 仅注册</span>
             <span v-else class="tag-neutral">模式: 全流程</span>
+            <span v-if="focused.params?.easyproxy?.enabled" class="tag-neutral">
+              网络: easyproxy {{ focused.params.easyproxy.port_min }}-{{ focused.params.easyproxy.port_max }}
+            </span>
+            <span v-else-if="focused.params?.proxy" class="tag-neutral">网络: 普通 proxy</span>
+            <span v-else class="tag-neutral">网络: 直连</span>
+            <span class="tag-neutral">master: {{ focused.params?.master_proxy ? '代理' : '直连' }}</span>
             <span class="tag-neutral">踢出策略: {{ kickModeLabel(focused.params?.kick_mode) }}</span>
             <span v-if="focused.params?.auto_push_cpa && focused.params?.kick_mode === 'after_each_auth'" class="tag-ok">CPA 自动推送: 逐账号即时</span>
             <span v-else-if="focused.params?.auto_push_cpa" class="tag-ok">CPA 自动推送: run 结束后</span>
@@ -444,6 +460,7 @@ onBeforeUnmount(() => {
                   <tr>
                     <th class="text-left px-2 py-1">round</th>
                     <th class="text-left px-2 py-1">email</th>
+                    <th class="text-left px-2 py-1">proxy</th>
                     <th class="text-left px-2 py-1">stage</th>
                     <th class="text-left px-2 py-1">kicked</th>
                     <th class="text-left px-2 py-1">error</th>
@@ -454,6 +471,9 @@ onBeforeUnmount(() => {
                   <tr v-for="m in focused.cohort" :key="m.email" class="border-t">
                     <td class="px-2 py-1">{{ m.round }}</td>
                     <td class="px-2 py-1 font-mono">{{ m.email }}</td>
+                    <td class="px-2 py-1">
+                      <span class="tag-neutral">{{ memberProxyLabel(m) }}</span>
+                    </td>
                     <td class="px-2 py-1">
                       <span class="tag-neutral">{{ m.stage || '-' }}</span>
                     </td>
@@ -468,7 +488,7 @@ onBeforeUnmount(() => {
                       >{{ kickingEmail === m.email ? '…' : '踢' }}</button>
                     </td>
                   </tr>
-                  <tr v-if="!focused.cohort?.length"><td colspan="6" class="px-2 py-2 text-slate-400">尚无成员</td></tr>
+                  <tr v-if="!focused.cohort?.length"><td colspan="7" class="px-2 py-2 text-slate-400">尚无成员</td></tr>
                 </tbody>
               </table>
             </div>

@@ -29,7 +29,7 @@ import requests
 
 from autofree import admin_state
 from autofree.proxy import build_requests_proxy_map, normalize_proxy_url
-from autofree.settings import get_proxy
+from autofree.settings import get_master_proxy_url
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +78,7 @@ class MasterClient:
 
         self.session = requests.Session()
         self.session.trust_env = False
-        proxy = proxy if proxy is not None else get_proxy()
+        proxy = proxy if proxy is not None else get_master_proxy_url()
         self.proxy = normalize_proxy_url(proxy)
         proxies = build_requests_proxy_map(self.proxy)
         if proxies:

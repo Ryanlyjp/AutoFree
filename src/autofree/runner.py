@@ -37,10 +37,11 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from autofree import cpa_push, master, storage
+from autofree import cpa_push, easyproxy, master, storage
 from autofree.config import AP_PROPAGATION_DELAY
 from autofree.mail import get_mail_client
-from autofree.settings import get_cpa_config, get_proxy
+from autofree.settings import easyproxy_enabled, get_cpa_config, get_easyproxy_config, get_master_proxy_url
+from autofree.settings import get_proxy, get_proxy_master_mode
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +162,16 @@ def _ensure_cpa_ready_for_auto_push() -> None:
         raise ValueError("已勾选自动推送 CPA,但 CPA 未配置 base_url / key")
 
 
+def _ensure_easyproxy_ready_for_run() -> None:
+    if not easyproxy_enabled():
+        return
+    status = easyproxy.get_status()
+    if not status.get("ok"):
+        raise ValueError(f"easyproxy 不可用: {status.get('error') or 'unknown error'}")
+    if not (status.get("summary") or {}).get("selectable"):
+        raise ValueError("easyproxy 当前没有可用端口，请先释放黑名单或检查 hybrid 节点")
+
+
 def normalize_kick_mode(value: str | None) -> str:
     mode = (value or KICK_MODE_ROUND_END).strip().lower()
     if mode not in _KICK_MODES:
@@ -189,6 +200,82 @@ def _append_member_error(member: dict[str, Any], message: str) -> None:
         return
     existing = (member.get("error") or "").strip()
     member["error"] = f"{existing}; {message}" if existing else message
+
+
+def _current_network_snapshot() -> dict[str, Any]:
+    easy_cfg = easyproxy.normalize_easyproxy_settings(existing=get_easyproxy_config())
+    return {
+        "proxy": get_proxy(),
+        "proxy_master_mode": get_proxy_master_mode(),
+        "master_proxy": get_master_proxy_url(),
+        "easyproxy": {
+            "enabled": bool(easy_cfg.get("enabled")),
+            "management_url": easy_cfg.get("management_url") or "",
+            "proxy_host": easy_cfg.get("proxy_host") or "127.0.0.1",
+            "pool_port": int(easy_cfg.get("pool_port") or 2323),
+            "port_min": int(easy_cfg.get("port_min") or 24000),
+            "port_max": int(easy_cfg.get("port_max") or 24100),
+            "cooldown_minutes": int(easy_cfg.get("cooldown_minutes") or 60),
+            "master_mode": easy_cfg.get("master_mode") or easyproxy.EASYPROXY_MASTER_MODE_DIRECT,
+        },
+    }
+
+
+def _assign_member_proxy(
+    *,
+    member: dict[str, Any],
+    used_easyproxy_ports: set[int],
+    log: Callable[[str, str], None],
+) -> str | None:
+    if easyproxy_enabled():
+        assignment = easyproxy.select_proxy_assignment(avoid_ports=used_easyproxy_ports)
+        used_easyproxy_ports.add(int(assignment["port"]))
+        member["proxy_mode"] = "easyproxy"
+        member["proxy_url"] = assignment["proxy_url"]
+        member["proxy_port"] = int(assignment["port"])
+        member["proxy_tag"] = assignment.get("tag") or ""
+        member["proxy_name"] = assignment.get("name") or ""
+        log(
+            f"[proxy] {member['email']} -> easyproxy {member['proxy_port']}"
+            f" ({member['proxy_tag'] or member['proxy_name'] or 'unknown'})"
+        )
+        return assignment["proxy_url"]
+
+    proxy = get_proxy().strip() or ""
+    member["proxy_mode"] = "proxy" if proxy else "direct"
+    member["proxy_url"] = proxy
+    member["proxy_port"] = 0
+    member["proxy_tag"] = ""
+    member["proxy_name"] = ""
+    return proxy or None
+
+
+def _member_proxy_url(member: dict[str, Any]) -> str | None:
+    proxy = str(member.get("proxy_url") or "").strip()
+    return proxy or None
+
+
+def _maybe_blacklist_member_proxy(
+    *,
+    member: dict[str, Any],
+    exc: Exception,
+    log: Callable[[str, str], None],
+) -> None:
+    if member.get("proxy_mode") != "easyproxy":
+        return
+    port = int(member.get("proxy_port") or 0)
+    if not port or not easyproxy.is_network_error(exc):
+        return
+    try:
+        easyproxy.mark_port_bad(
+            port,
+            str(exc),
+            tag=str(member.get("proxy_tag") or ""),
+            name=str(member.get("proxy_name") or ""),
+        )
+        log(f"[proxy] easyproxy 端口 {port} 已加入本地黑名单", "warning")
+    except Exception as mark_exc:
+        log(f"[proxy] easyproxy 黑名单写入失败: {mark_exc}", "warning")
 
 
 def _kick_member(
@@ -288,7 +375,7 @@ def _run_round(
     Flow = _build_flow()
     kick_mode = normalize_kick_mode(kick_mode)
 
-    proxy = get_proxy() or None
+    used_easyproxy_ports: set[int] = set()
     mail = get_mail_client(mail_provider)
     mail.login()
 
@@ -345,13 +432,15 @@ def _run_round(
             "error": "",
         }
         storage.update_cohort_member(run_id, email, member)
-
-        flow = Flow(
-            proxy=proxy, tag=email.split("@")[0], mail_client=mail,
-            log_emitter=log, master_account_id=master_client.account_id,
-        )
-        flow.set_mail_context(mailbox_id)
+        flow = None
         try:
+            flow_proxy = _assign_member_proxy(member=member, used_easyproxy_ports=used_easyproxy_ports, log=log)
+            storage.update_cohort_member(run_id, email, member)
+            flow = Flow(
+                proxy=flow_proxy, tag=email.split("@")[0], mail_client=mail,
+                log_emitter=log, master_account_id=master_client.account_id,
+            )
+            flow.set_mail_context(mailbox_id)
             flow.start()
             flow.run_register(email, password, name, birthdate)
             member["stage"] = "registered"
@@ -362,6 +451,7 @@ def _run_round(
             member["stage"] = "register_failed"
             member["error"] = str(exc)
             summary["errors"].append({"email": email, "where": "register", "msg": str(exc)})
+            _maybe_blacklist_member_proxy(member=member, exc=exc, log=log)
             log(f"  ✗ 注册失败 {email}: {exc}", "error")
         finally:
             try:
@@ -404,12 +494,13 @@ def _run_round(
         email = member["email"]
         oauth_ok = False
         log(f"[Round {round_index}] step 5/6 — OAuth {i}/{len(successes)} {email}")
-        flow = Flow(
-            proxy=proxy, tag=email.split("@")[0], mail_client=mail,
-            log_emitter=log, master_account_id=master_client.account_id,
-        )
-        flow.set_mail_context(member.get("mailbox_id"))
+        flow = None
         try:
+            flow = Flow(
+                proxy=_member_proxy_url(member), tag=email.split("@")[0], mail_client=mail,
+                log_emitter=log, master_account_id=master_client.account_id,
+            )
+            flow.set_mail_context(member.get("mailbox_id"))
             flow.start()
             tokens = flow.oauth_personal(email, member["password"])
             if not tokens or not tokens.get("access_token"):
@@ -426,6 +517,7 @@ def _run_round(
             member["stage"] = "oauth_failed"
             member["error"] = str(exc)
             summary["errors"].append({"email": email, "where": "oauth", "msg": str(exc)})
+            _maybe_blacklist_member_proxy(member=member, exc=exc, log=log)
             log(f"  ✗ OAuth 失败 {email}: {exc}", "error")
         finally:
             try:
@@ -658,13 +750,14 @@ def start_run(
     kick_mode = normalize_kick_mode(kick_mode)
     if auto_push_cpa:
         _ensure_cpa_ready_for_auto_push()
+    _ensure_easyproxy_ready_for_run()
 
     record = storage.create_run(
         rounds=rounds,
         per_round=per_round,
         params={
             "mail_provider": mail_provider or "",
-            "proxy": get_proxy(),
+            **_current_network_snapshot(),
             "register_only": register_only,
             "auto_push_cpa": auto_push_cpa,
             "kick_mode": kick_mode,
@@ -696,12 +789,13 @@ def run_blocking(
     kick_mode = normalize_kick_mode(kick_mode)
     if auto_push_cpa:
         _ensure_cpa_ready_for_auto_push()
+    _ensure_easyproxy_ready_for_run()
     record = storage.create_run(
         rounds=rounds,
         per_round=per_round,
         params={
             "mail_provider": mail_provider or "",
-            "proxy": get_proxy(),
+            **_current_network_snapshot(),
             "register_only": register_only,
             "auto_push_cpa": auto_push_cpa,
             "kick_mode": kick_mode,

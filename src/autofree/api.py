@@ -15,7 +15,9 @@ Static files served at /  ← src/autofree/web/dist (Vue build output).
 
 from __future__ import annotations
 
+import copy
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any, Literal
@@ -28,11 +30,13 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from autofree import admin_state, cpa_push, master, runner, storage
+from autofree import admin_state, cpa_push, easyproxy, master, runner, storage
 from autofree.config import get_api_key
 from autofree.mail import get_mail_client
 from autofree.proxy import ProxyConfigError, build_requests_proxy_map, normalize_proxy_url
+from autofree.settings import PROXY_MASTER_MODE_DIRECT, PROXY_MASTER_MODE_FOLLOW
 from autofree.settings import get_all as settings_get_all
+from autofree.settings import get_master_proxy_url
 from autofree.settings import update as settings_update
 
 logger = logging.getLogger(__name__)
@@ -80,6 +84,8 @@ class SettingsPatch(BaseModel):
     """Partial update — fields omitted are kept untouched. Deep-merged into JSON."""
 
     proxy: str | None = None
+    proxy_master_mode: Literal["follow_proxy", "direct"] | None = None
+    easyproxy: dict[str, Any] | None = None
     mail: dict[str, Any] | None = None
     cpa: dict[str, Any] | None = None
 
@@ -100,6 +106,19 @@ def settings_patch(patch: SettingsPatch) -> dict[str, Any]:
             update_payload["proxy"] = normalize_proxy_url(patch.proxy) or ""
         except ProxyConfigError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if patch.proxy_master_mode is not None:
+        update_payload["proxy_master_mode"] = patch.proxy_master_mode
+    if patch.easyproxy is not None:
+        raw_easyproxy = copy.deepcopy(patch.easyproxy)
+        if _looks_masked_secret(raw_easyproxy.get("password")):
+            raw_easyproxy.pop("password", None)
+        try:
+            update_payload["easyproxy"] = easyproxy.normalize_easyproxy_settings(
+                raw_easyproxy,
+                existing=(settings_get_all().get("easyproxy") or {}),
+            )
+        except easyproxy.EasyProxyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     if patch.mail is not None:
         update_payload["mail"] = patch.mail
     if patch.cpa is not None:
@@ -119,8 +138,22 @@ def _mask_settings(data: dict[str, Any]) -> dict[str, Any]:
             return f"<set:{len(v)}>"
         return v
 
+    easyproxy_cfg = easyproxy.normalize_easyproxy_settings(existing=(data.get("easyproxy") or {}))
     out = {
         "proxy": data.get("proxy") or "",
+        "proxy_master_mode": data.get("proxy_master_mode") or PROXY_MASTER_MODE_FOLLOW,
+        "easyproxy": {
+            "enabled": bool(easyproxy_cfg.get("enabled")),
+            "management_url": easyproxy_cfg.get("management_url") or "",
+            "password": mask(easyproxy_cfg.get("password") or ""),
+            "proxy_host": easyproxy_cfg.get("proxy_host") or "127.0.0.1",
+            "pool_port": int(easyproxy_cfg.get("pool_port") or 2323),
+            "port_min": int(easyproxy_cfg.get("port_min") or 24000),
+            "port_max": int(easyproxy_cfg.get("port_max") or 24100),
+            "cooldown_minutes": int(easyproxy_cfg.get("cooldown_minutes") or 60),
+            "master_mode": easyproxy_cfg.get("master_mode") or easyproxy.EASYPROXY_MASTER_MODE_DIRECT,
+            "local_blacklist": easyproxy_cfg.get("local_blacklist") or {},
+        },
         "mail": {"provider": (data.get("mail") or {}).get("provider") or "tempmail"},
         "cpa": {},
     }
@@ -137,6 +170,10 @@ def _mask_settings(data: dict[str, Any]) -> dict[str, Any]:
         "key": mask(cpa.get("key") or ""),
     }
     return out
+
+
+def _looks_masked_secret(value: Any) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"<set:\d+>", value))
 
 
 # ============================================================ mail / cpa probes
@@ -166,6 +203,8 @@ def cpa_probe() -> dict[str, Any]:
 
 @app.post("/api/proxy/probe", dependencies=[Depends(require_api_key)])
 def proxy_probe() -> dict[str, Any]:
+    if (settings_get_all().get("easyproxy") or {}).get("enabled"):
+        return {"ok": False, "error": "easyproxy 已启用，普通 proxy 模块当前处于停用状态"}
     raw = (settings_get_all().get("proxy") or "").strip()
     if not raw:
         return {"ok": False, "error": "未配置代理"}
@@ -182,6 +221,24 @@ def proxy_probe() -> dict[str, Any]:
         return {"ok": True, "status": resp.status_code, "latency_ms": latency_ms}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
+
+
+@app.get("/api/easyproxy/status", dependencies=[Depends(require_api_key)])
+def easyproxy_status() -> dict[str, Any]:
+    return easyproxy.get_status()
+
+
+class EasyProxyReleaseReq(BaseModel):
+    ports: list[int] | None = None
+    remote: bool = True
+
+
+@app.post("/api/easyproxy/release", dependencies=[Depends(require_api_key)])
+def easyproxy_release(req: EasyProxyReleaseReq) -> dict[str, Any]:
+    try:
+        return easyproxy.release_ports(req.ports, remote=req.remote)
+    except easyproxy.EasyProxyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # ============================================================ master
@@ -215,6 +272,7 @@ class KickReq(BaseModel):
 def master_state() -> dict[str, Any]:
     summary = admin_state.get_summary()
     summary["proxy"] = (settings_get_all().get("proxy") or "")
+    summary["master_proxy"] = get_master_proxy_url()
     return summary
 
 
